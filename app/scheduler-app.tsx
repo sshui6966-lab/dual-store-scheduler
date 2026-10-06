@@ -1,206 +1,287 @@
 "use client";
 
-import { useEffect, useMemo, useRef, useState } from "react";
-import { AlertTriangle, CalendarDays, Check, ChevronLeft, ChevronRight, CircleUserRound, Clock3, Lock, Plus, Sparkles, Store as StoreIcon, UsersRound } from "lucide-react";
+import { useEffect, useRef, useState } from "react";
+import { AlertTriangle, CalendarDays, Check, ChevronLeft, ChevronRight, ClipboardCheck, Clock3, Download, FileSpreadsheet, History, ImageDown, LayoutGrid, ListChecks, Lock, MoreHorizontal, Plus, RotateCcw, Settings2, Sparkles, Store as StoreIcon, UserPlus, UsersRound } from "lucide-react";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { Dialog, DialogContent, DialogDescription, DialogHeader, DialogTitle } from "@/components/ui/dialog";
-import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
 import { Switch } from "@/components/ui/switch";
-import { type AppState, type Assignment, type Availability, type MiddleShift, type Role, type Staff, type Store, days, emptyWeek, generateSchedule, hoursFor, initialState, shiftLabel, stores } from "@/lib/scheduler";
+import {
+  type AppState, type Assignment, type Availability, type MiddleShift, type Participation, type PeriodState, type Role, type Staff, type Store, type TimeWindow,
+  dateLabel, dateList, emptyPeriod, generateSchedule, hoursFor, initialState, isoDate, migrateState, parseDate, shiftLabel, shiftTimes, shortDate, stores,
+} from "@/lib/scheduler";
 
-const statusLabel: Record<Availability, string> = { unconfirmed: "未确认", all: "全天", off: "休", early: "白", late: "晚" };
-const statusCycle: Availability[] = ["unconfirmed", "all", "early", "late", "off"];
+const availabilityOptions: Array<{ value: Availability; label: string; short: string }> = [
+  { value: "unconfirmed", label: "未确认", short: "未确认" },
+  { value: "all", label: "全天可排", short: "全天" },
+  { value: "early", label: "只上白班", short: "白班" },
+  { value: "late", label: "只上晚班", short: "晚班" },
+  { value: "off", label: "休息", short: "休" },
+  { value: "custom", label: "自定义时间", short: "自定" },
+];
+const participationLabel: Record<Participation, string> = { unconfirmed: "未确认", confirmed: "已确认", excluded: "本期不参与" };
+const statusLabel = Object.fromEntries(availabilityOptions.map((item) => [item.value, item.short])) as Record<Availability, string>;
 
-function mondayOf(date: Date) {
-  const result = new Date(date);
-  const day = result.getDay() || 7;
-  result.setDate(result.getDate() - day + 1);
-  result.setHours(0, 0, 0, 0);
-  return result;
+function todayRange() {
+  const start = new Date(); start.setHours(0, 0, 0, 0);
+  const end = new Date(start); end.setDate(end.getDate() + 6);
+  return { startDate: isoDate(start), endDate: isoDate(end) };
 }
-function weekKey(date: Date) {
-  return `${date.getFullYear()}-${String(date.getMonth() + 1).padStart(2, "0")}-${String(date.getDate()).padStart(2, "0")}`;
-}
-function weekRange(date: Date) {
-  const end = new Date(date);
-  end.setDate(end.getDate() + 6);
-  return `${date.getMonth() + 1}.${date.getDate()} — ${end.getMonth() + 1}.${end.getDate()}`;
-}
+function makeActivity(label: string) { return { id: `activity-${Date.now()}-${Math.random()}`, at: new Date().toISOString(), label }; }
+function safeFilename(value: string) { return value.replace(/[\\/:*?"<>|]/g, "-"); }
 
 export function SchedulerApp() {
   const [state, setState] = useState<AppState>(initialState);
-  const [weekStart, setWeekStart] = useState(() => mondayOf(new Date()));
+  const [periodKey, setPeriodKey] = useState("");
   const [loaded, setLoaded] = useState(false);
   const [saveStatus, setSaveStatus] = useState("正在连接…");
-  const [dayIndex, setDayIndex] = useState(0);
   const [tab, setTab] = useState("home");
+  const [dayIndex, setDayIndex] = useState(0);
+  const [scheduleView, setScheduleView] = useState<"daily" | "week" | "period">("daily");
+  const [periodOpen, setPeriodOpen] = useState(false);
+  const [periodEditing, setPeriodEditing] = useState(false);
+  const range = todayRange();
+  const [periodDraft, setPeriodDraft] = useState({ title: "", startDate: range.startDate, endDate: range.endDate, deadline: "" });
   const [editingStaff, setEditingStaff] = useState<Staff | null>(null);
-  const [editingSlotId, setEditingSlotId] = useState<string | null>(null);
+  const [addingStaff, setAddingStaff] = useState(false);
+  const [availabilityEditor, setAvailabilityEditor] = useState<{ staffId: string; day: number } | null>(null);
+  const [customDraft, setCustomDraft] = useState<TimeWindow>({ start: "12:00", end: "18:00" });
   const [middleOpen, setMiddleOpen] = useState(false);
-  const [middleDraft, setMiddleDraft] = useState<{ day: number; store: Store; role: Role; start: string; end: string }>({ day: 0, store: "星光店", role: "SS", start: "12:00", end: "18:00" });
+  const [middleDraft, setMiddleDraft] = useState<Omit<MiddleShift, "id">>({ day: 0, store: "星光店", name: "中班", requirement: "ANY", headcount: 1, start: "12:00", end: "18:00", note: "" });
+  const [editingSlotId, setEditingSlotId] = useState<string | null>(null);
+  const [moreOpen, setMoreOpen] = useState(false);
+  const [activityOpen, setActivityOpen] = useState(false);
+  const [canUndo, setCanUndo] = useState(false);
   const saveTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
-  const key = weekKey(weekStart);
-  const week = state.weeks[key] ?? emptyWeek(state.staff);
+  const undoStack = useRef<PeriodState[]>([]);
+
+  const period = state.periods[periodKey];
+  const dates = period ? dateList(period.startDate, period.endDate) : [];
+  const activeStaff = state.staff.filter((person) => person.active);
+  const confirmed = period ? activeStaff.filter((person) => period.participation[person.id] === "confirmed").length : 0;
+  const excluded = period ? activeStaff.filter((person) => period.participation[person.id] === "excluded").length : 0;
+  const unconfirmed = activeStaff.length - confirmed - excluded;
+  const hardWarnings = period?.warnings.filter((warning) => warning.startsWith("【硬】")) ?? [];
+  const softWarnings = period?.warnings.filter((warning) => !warning.startsWith("【硬】")) ?? [];
 
   useEffect(() => {
     let alive = true;
     fetch("/api/state").then(async (response) => {
       if (!response.ok) throw new Error("unavailable");
-      return response.json() as Promise<{ state: AppState | null; updatedAt: string | null }>;
+      return response.json() as Promise<{ state: unknown; updatedAt: string | null }>;
     }).then((data) => {
       if (!alive) return;
-      if (data.state) setState(data.state);
-      setSaveStatus(data.state ? "已同步" : "已创建新班表");
-    }).catch(() => setSaveStatus("暂未连接云端")).finally(() => alive && setLoaded(true));
+      const next = migrateState(data.state);
+      if (!Object.keys(next.periods).length) {
+        const initialRange = todayRange();
+        const created = emptyPeriod(next.staff, initialRange.startDate, initialRange.endDate);
+        next.periods[created.id] = created;
+      }
+      const selected = Object.entries(next.periods).sort((a, b) => b[1].startDate.localeCompare(a[1].startDate))[0][0];
+      setState(next); setPeriodKey(selected); setSaveStatus(data.state ? "已同步" : "已创建新周期");
+    }).catch(() => {
+      const next = initialState(); const initialRange = todayRange(); const created = emptyPeriod(next.staff, initialRange.startDate, initialRange.endDate); next.periods[created.id] = created;
+      if (alive) { setState(next); setPeriodKey(created.id); setSaveStatus("暂未连接云端"); }
+    }).finally(() => alive && setLoaded(true));
     return () => { alive = false; };
   }, []);
 
   useEffect(() => {
-    if (!loaded) return;
+    if (!loaded || !periodKey) return;
     if (saveTimer.current) clearTimeout(saveTimer.current);
-    setSaveStatus("保存中…");
     saveTimer.current = setTimeout(() => {
+      setSaveStatus("保存中…");
       fetch("/api/state", { method: "PUT", headers: { "content-type": "application/json" }, body: JSON.stringify(state) })
-        .then((response) => { if (!response.ok) throw new Error("save failed"); setSaveStatus("已同步"); })
-        .catch(() => setSaveStatus("保存失败，请重试"));
-    }, 650);
+        .then((response) => { if (!response.ok) throw new Error("save failed"); setSaveStatus(`已保存 ${new Date().toLocaleTimeString("zh-CN", { hour: "2-digit", minute: "2-digit" })}`); })
+        .catch(() => setSaveStatus("保存失败，点击重试"));
+    }, 500);
     return () => { if (saveTimer.current) clearTimeout(saveTimer.current); };
-  }, [state, loaded]);
+  }, [state, loaded, periodKey]);
 
-  const updateWeek = (updater: (current: ReturnType<typeof emptyWeek>) => ReturnType<typeof emptyWeek>) => {
-    setState((current) => {
-      const existing = current.weeks[key] ?? emptyWeek(current.staff);
-      return { ...current, weeks: { ...current.weeks, [key]: updater(existing) } };
-    });
+  const updatePeriod = (label: string, updater: (current: PeriodState) => PeriodState, keepPublished = false) => {
+    if (!periodKey) return;
+    const existing = state.periods[periodKey];
+    if (!existing) return;
+    undoStack.current.push(structuredClone(existing));
+    if (undoStack.current.length > 30) undoStack.current.shift();
+    setCanUndo(true);
+    const updated = updater(existing);
+    const next = { ...updated, activities: [makeActivity(label), ...(updated.activities ?? [])].slice(0, 200) };
+    if (!keepPublished && existing.status === "published") next.status = "adjusted";
+    setState((current) => ({ ...current, periods: { ...current.periods, [periodKey]: next } }));
+  };
+  const undo = () => {
+    const previous = undoStack.current.pop();
+    if (!previous || !periodKey) return;
+    setCanUndo(undoStack.current.length > 0);
+    setState((current) => ({ ...current, periods: { ...current.periods, [periodKey]: { ...previous, activities: [makeActivity("撤销上一项修改"), ...previous.activities] } } }));
   };
 
-  const activeStaff = state.staff.filter((person) => person.active);
-  const confirmed = activeStaff.filter((person) => (week.availability[person.id] ?? []).every((value) => value !== "unconfirmed")).length;
-  const hardWarnings = week.warnings.filter((warning) => warning.includes("缺少") || warning.includes("尚未确认"));
-
-  const runSchedule = () => {
-    updateWeek((current) => {
-      const result = generateSchedule(state.staff, current);
-      return { ...current, assignments: result.assignments, warnings: result.warnings, published: false };
-    });
-    setTab("schedule");
+  const openNewPeriod = () => { const initialRange = todayRange(); setPeriodEditing(false); setPeriodDraft({ title: "", startDate: initialRange.startDate, endDate: initialRange.endDate, deadline: "" }); setPeriodOpen(true); };
+  const openEditPeriod = () => { if (!period) return; setPeriodEditing(true); setPeriodDraft({ title: period.title, startDate: period.startDate, endDate: period.endDate, deadline: period.deadline ?? "" }); setPeriodOpen(true); };
+  const savePeriod = () => {
+    if (!periodDraft.startDate || !periodDraft.endDate || periodDraft.endDate < periodDraft.startDate) return;
+    if (periodEditing && period) {
+      const nextDates = dateList(periodDraft.startDate, periodDraft.endDate);
+      updatePeriod("修改排班周期", (current) => ({ ...current, title: periodDraft.title || `${shortDate(periodDraft.startDate)}—${shortDate(periodDraft.endDate)}`, startDate: periodDraft.startDate, endDate: periodDraft.endDate, deadline: periodDraft.deadline || undefined, availability: Object.fromEntries(state.staff.map((person) => [person.id, Array.from({ length: nextDates.length }, (_, index) => current.availability[person.id]?.[index] ?? "unconfirmed")])), assignments: [], warnings: [], status: "collecting" }));
+    } else {
+      const created = emptyPeriod(state.staff, periodDraft.startDate, periodDraft.endDate, periodDraft.title || undefined); created.deadline = periodDraft.deadline || undefined; created.activities = [makeActivity("创建排班周期")];
+      setState((current) => ({ ...current, periods: { ...current.periods, [created.id]: created } })); setPeriodKey(created.id); setDayIndex(0);
+    }
+    setPeriodOpen(false);
   };
-  const confirmFullTime = () => updateWeek((current) => {
-    const availability = { ...current.availability };
-    state.staff.filter((person) => person.active && person.employment === "全职").forEach((person) => { availability[person.id] = Array<Availability>(7).fill("all"); });
-    return { ...current, availability };
+
+  const setAvailability = (staffId: string, day: number, value: Availability) => updatePeriod(`修改${state.staff.find((person) => person.id === staffId)?.name}的${dates[day] ? shortDate(dates[day]) : "日期"}可排时间`, (current) => {
+    const row = [...(current.availability[staffId] ?? Array<Availability>(dates.length).fill("unconfirmed"))]; row[day] = value;
+    return { ...current, availability: { ...current.availability, [staffId]: row }, warnings: [], status: "collecting" };
   });
-  const setPersonWeek = (staffId: string, value: Availability) => updateWeek((current) => ({ ...current, availability: { ...current.availability, [staffId]: Array<Availability>(7).fill(value) } }));
-  const cycleStatus = (staffId: string, day: number) => updateWeek((current) => {
-    const row = [...(current.availability[staffId] ?? Array<Availability>(7).fill("unconfirmed"))];
-    row[day] = statusCycle[(statusCycle.indexOf(row[day]) + 1) % statusCycle.length];
-    return { ...current, availability: { ...current.availability, [staffId]: row } };
-  });
-  const addMiddle = () => {
-    const slot: MiddleShift = { ...middleDraft, id: `middle-${Date.now()}` };
-    updateWeek((current) => ({ ...current, middleShifts: [...current.middleShifts, slot], assignments: [], warnings: [] }));
-    setMiddleOpen(false);
-    setDayIndex(middleDraft.day);
+  const setWholePeriod = (staffId: string, value: Availability) => updatePeriod(`批量设置${state.staff.find((person) => person.id === staffId)?.name}全周期状态`, (current) => ({ ...current, availability: { ...current.availability, [staffId]: Array<Availability>(dates.length).fill(value) }, participation: { ...current.participation, [staffId]: value === "unconfirmed" ? "unconfirmed" : current.participation[staffId] }, warnings: [], status: "collecting" }));
+  const setParticipation = (staffId: string, value: Participation) => updatePeriod(`${state.staff.find((person) => person.id === staffId)?.name}标记为${participationLabel[value]}`, (current) => ({ ...current, participation: { ...current.participation, [staffId]: value }, warnings: [] }));
+  const confirmPerson = (staffId: string) => {
+    if ((period.availability[staffId] ?? []).some((item) => item === "unconfirmed")) { setAvailabilityEditor({ staffId, day: Math.max(0, period.availability[staffId].findIndex((item) => item === "unconfirmed")) }); return; }
+    setParticipation(staffId, "confirmed");
   };
-  const updateStaff = (next: Staff) => {
-    setState((current) => ({ ...current, staff: current.staff.map((person) => person.id === next.id ? next : person) }));
-    setEditingStaff(null);
+  const saveCustomTime = () => {
+    if (!availabilityEditor) return;
+    const { staffId, day } = availabilityEditor;
+    updatePeriod(`设置${state.staff.find((person) => person.id === staffId)?.name}自定义时间`, (current) => {
+      const row = [...current.availability[staffId]]; row[day] = "custom";
+      return { ...current, availability: { ...current.availability, [staffId]: row }, customTimes: { ...current.customTimes, [staffId]: { ...(current.customTimes[staffId] ?? {}), [day]: [customDraft] } }, status: "collecting" };
+    }); setAvailabilityEditor(null);
   };
-  const editingSlot = week.assignments.find((item) => item.id === editingSlotId) ?? null;
-  const alreadyWorking = new Set(week.assignments.filter((item) => item.day === editingSlot?.day && item.id !== editingSlot?.id && item.staffId).map((item) => item.staffId));
-  const candidates = editingSlot ? state.staff.filter((person) => person.active && person.role === editingSlot.role && !alreadyWorking.has(person.id)) : [];
-  const updateSlot = (staffId: string | null, locked = true) => {
-    if (!editingSlot) return;
-    updateWeek((current) => ({ ...current, assignments: current.assignments.map((item) => item.id === editingSlot.id ? { ...item, staffId, locked } : item), published: false }));
+
+  const addMiddle = () => { const item: MiddleShift = { ...middleDraft, id: `middle-${Date.now()}` }; updatePeriod(`新增${item.store}${item.name}`, (current) => ({ ...current, middleShifts: [...current.middleShifts, item], assignments: [], warnings: [], status: "draft" })); setMiddleOpen(false); setDayIndex(item.day); };
+  const deleteMiddle = (id: string) => updatePeriod("删除中班", (current) => ({ ...current, middleShifts: current.middleShifts.filter((item) => item.id !== id), assignments: current.assignments.filter((item) => item.middleId !== id), warnings: [] }));
+
+  const runSchedule = () => { if (!period) return; const result = generateSchedule(state.staff, period); updatePeriod("自动生成班表", (current) => ({ ...current, assignments: result.assignments, warnings: result.warnings, status: "draft" }), true); setTab("schedule"); };
+  const publish = () => {
+    if (hardWarnings.length) return;
+    updatePeriod("发布并锁定班表", (current) => ({ ...current, status: "published", version: current.version + 1, publishedAt: new Date().toISOString(), assignments: current.assignments.map((item) => ({ ...item, locked: true })) }), true);
   };
-  const staffHours = useMemo(() => {
-    const totals = new Map<string, number>();
-    week.assignments.forEach((item) => { if (item.staffId) totals.set(item.staffId, (totals.get(item.staffId) ?? 0) + hoursFor(item)); });
-    return totals;
-  }, [week.assignments]);
-  const moveWeek = (offset: number) => {
-    const next = new Date(weekStart);
-    next.setDate(next.getDate() + offset * 7);
-    setWeekStart(next);
-    setDayIndex(0);
+  const editingSlot = period?.assignments.find((item) => item.id === editingSlotId) ?? null;
+  const candidateStaff = editingSlot ? state.staff.filter((person) => person.active && (editingSlot.role === "ANY" || person.role === editingSlot.role) && !period.assignments.some((item) => item.day === editingSlot.day && item.id !== editingSlot.id && item.staffId === person.id)) : [];
+  const updateSlot = (staffId: string | null) => { if (!editingSlot) return; updatePeriod(`调整${dateLabel(dates[editingSlot.day])}${editingSlot.store}${shiftLabel(editingSlot.shift)}`, (current) => ({ ...current, assignments: current.assignments.map((item) => item.id === editingSlot.id ? { ...item, staffId, locked: true } : item), warnings: [] })); setEditingSlotId(null); };
+
+  const staffHours = new Map<string, number>(); period?.assignments.forEach((item) => { if (item.staffId) staffHours.set(item.staffId, (staffHours.get(item.staffId) ?? 0) + hoursFor(item)); });
+  const addStaff = (person: Staff) => {
+    const created = { ...person, id: `staff-${Date.now()}` };
+    setState((current) => ({ ...current, staff: [...current.staff, created], periods: Object.fromEntries(Object.entries(current.periods).map(([key, value]) => [key, { ...value, availability: { ...value.availability, [created.id]: Array<Availability>(dateList(value.startDate, value.endDate).length).fill("unconfirmed") }, participation: { ...value.participation, [created.id]: "unconfirmed" } }])) }));
+    setAddingStaff(false);
+  };
+  const updateStaff = (person: Staff) => { setState((current) => ({ ...current, staff: current.staff.map((item) => item.id === person.id ? person : item) })); setEditingStaff(null); };
+
+  const exportExcel = () => {
+    if (!period) return;
+    const header = ["员工", "身份", ...dates.map(dateLabel), "本周期工时"];
+    const rows = state.staff.filter((person) => person.active).map((person) => [person.name, `${person.employment}${person.role}`, ...dates.map((_, day) => {
+      const slot = period.assignments.find((item) => item.day === day && item.staffId === person.id); return slot ? `${slot.store}${shiftLabel(slot.shift)}` : "休";
+    }), (staffHours.get(person.id) ?? 0).toFixed(2)]);
+    const html = `<html><head><meta charset="UTF-8"></head><body><table border="1"><tr>${header.map((cell) => `<th>${cell}</th>`).join("")}</tr>${rows.map((row) => `<tr>${row.map((cell) => `<td>${cell}</td>`).join("")}</tr>`).join("")}</table></body></html>`;
+    downloadBlob(new Blob([html], { type: "application/vnd.ms-excel;charset=utf-8" }), `${safeFilename(period.title)}-班表.xls`);
+  };
+  const exportImage = () => {
+    if (!period) return;
+    const width = 1080; const rowHeight = 58; const height = 190 + state.staff.filter((person) => person.active).length * rowHeight;
+    const canvas = document.createElement("canvas"); canvas.width = width; canvas.height = height; const ctx = canvas.getContext("2d"); if (!ctx) return;
+    ctx.fillStyle = "#f7f3e8"; ctx.fillRect(0, 0, width, height); ctx.fillStyle = "#720020"; ctx.fillRect(0, 0, width, 130); ctx.fillStyle = "#fffaf0"; ctx.font = "bold 42px Arial"; ctx.fillText("双店排班表", 48, 58); ctx.font = "26px Arial"; ctx.fillText(`${shortDate(period.startDate)} — ${shortDate(period.endDate)} · 版本 ${period.version || "草稿"}`, 48, 103);
+    const people = state.staff.filter((person) => person.active); const columnWidth = Math.max(76, Math.min(130, (width - 220) / Math.min(dates.length, 9)));
+    ctx.font = "bold 22px Arial"; ctx.fillStyle = "#35283c"; ctx.fillText("员工", 34, 168);
+    dates.slice(0, 9).forEach((date, index) => ctx.fillText(shortDate(date).replace("月", "/").replace("日", ""), 200 + index * columnWidth, 168));
+    people.forEach((person, row) => { const y = 205 + row * rowHeight; ctx.fillStyle = row % 2 ? "#d2c99b" : "#fffaf0"; ctx.fillRect(20, y - 32, width - 40, rowHeight - 4); ctx.fillStyle = "#35283c"; ctx.font = "bold 22px Arial"; ctx.fillText(person.name, 34, y); ctx.font = "18px Arial"; dates.slice(0, 9).forEach((_, day) => { const slot = period.assignments.find((item) => item.day === day && item.staffId === person.id); ctx.fillText(slot ? `${slot.store.slice(0, 2)}${shiftLabel(slot.shift).slice(0, 1)}` : "休", 200 + day * columnWidth, y); }); });
+    canvas.toBlob((blob) => blob && downloadBlob(blob, `${safeFilename(period.title)}-班表.png`), "image/png");
   };
 
   useEffect(() => {
     const context = (document as Document & { modelContext?: { registerTool: (tool: unknown, options?: { signal: AbortSignal }) => void | Promise<void> } }).modelContext;
-    if (!context?.registerTool) return;
+    if (!context?.registerTool || !period) return;
     const lifecycle = new AbortController();
-    const register = (tool: unknown) => Promise.resolve(context.registerTool(tool, { signal: lifecycle.signal })).catch(() => undefined);
-    void register({ name: "read_current_schedule", title: "读取当前班表", description: "读取当前周确认进度和排班异常。", inputSchema: { type: "object", properties: {}, additionalProperties: false }, annotations: { readOnlyHint: true, untrustedContentHint: false }, execute: () => ({ week: key, confirmed, total: activeStaff.length, warnings: week.warnings }) });
-    void register({ name: "generate_current_schedule", title: "生成当前周班表", description: "根据当前人员条件生成本周班表。", inputSchema: { type: "object", properties: {}, additionalProperties: false }, annotations: { readOnlyHint: false, untrustedContentHint: false }, execute: () => { const result = generateSchedule(state.staff, week); updateWeek((current) => ({ ...current, assignments: result.assignments, warnings: result.warnings, published: false })); return { generated: result.assignments.length > 0, warnings: result.warnings }; } });
+    void Promise.resolve(context.registerTool({ name: "read_current_schedule", title: "读取当前班表", description: "读取当前周期确认进度和排班异常。", inputSchema: { type: "object", properties: {}, additionalProperties: false }, annotations: { readOnlyHint: true, untrustedContentHint: false }, execute: () => ({ period: period.title, confirmed, total: activeStaff.length, warnings: period.warnings }) }, { signal: lifecycle.signal })).catch(() => undefined);
     return () => lifecycle.abort();
-  }, [key, confirmed, activeStaff.length, state.staff, week]);
+  }, [period, confirmed, activeStaff.length]);
+
+  if (!period) return <main className="loading-screen">正在准备排班工作台…</main>;
 
   return (
     <main className="app-shell">
       <div className="poster-strip" aria-hidden="true"><span /><span /><span /><span /><span /></div>
-      <header className="topbar"><div><p className="eyebrow">DUAL STORE / WEEKLY ROSTER</p><h1>双店排班助手</h1></div><div className="sync-pill"><span />{saveStatus}</div></header>
-      <div className="week-switcher"><button aria-label="上一周" onClick={() => moveWeek(-1)}><ChevronLeft /></button><div><b>{weekRange(weekStart)}</b><small>{key} 开始</small></div><button aria-label="下一周" onClick={() => moveWeek(1)}><ChevronRight /></button></div>
+      <header className="topbar"><div><p className="eyebrow">DUAL STORE / MANAGER DESK</p><h1>双店排班助手</h1></div><button className="more-button" onClick={() => setMoreOpen(true)} aria-label="更多"><MoreHorizontal /></button></header>
+      <div className="period-switcher"><button onClick={() => setPeriodKey(previousPeriodKey(state, periodKey, -1) ?? periodKey)} aria-label="上一个周期"><ChevronLeft /></button><button className="period-title" onClick={() => setMoreOpen(true)}><b>{period.title}</b><small>{shortDate(period.startDate)}—{shortDate(period.endDate)} · {dates.length}天</small></button><button onClick={() => setPeriodKey(previousPeriodKey(state, periodKey, 1) ?? periodKey)} aria-label="下一个周期"><ChevronRight /></button></div>
+      <div className="save-line"><span className={saveStatus.includes("失败") ? "error" : ""}>{saveStatus}</span><span>{period.status === "published" ? `已发布 V${period.version}` : period.status === "adjusted" ? "有临时调整" : "草稿"}</span></div>
 
       <Tabs value={tab} onValueChange={setTab} className="app-tabs">
         <div className="page-frame">
-          <TabsContent value="home" className="tab-panel">
-            <section className="dashboard-grid">
-              <article className="hero-card color-wine"><div className="lamp-geometry" aria-hidden="true"><span /><i /></div><p>本周准备度</p><strong>{confirmed}<em> / {activeStaff.length}</em></strong><span>人员信息已确认</span><button className="primary-action" onClick={() => setTab("availability")}>继续确认人员</button></article>
-              <article className="metric-card color-blue"><CalendarDays /><b>{week.assignments.filter((item) => item.staffId).length}</b><span>已安排人次</span></article>
-              <article className="metric-card color-orange"><AlertTriangle /><b>{hardWarnings.length}</b><span>需要处理</span></article>
-            </section>
-            <section className="action-stage"><div><p className="section-kicker">AUTO SCHEDULE</p><h2>先确认，再排班。</h2><p>普通班固定 1 SS + 1 BB；中班可按繁忙时段临时增加。</p></div><button className="generate-button" onClick={runSchedule} disabled={confirmed !== activeStaff.length}><Sparkles />{confirmed === activeStaff.length ? "生成本周班表" : `还差 ${activeStaff.length - confirmed} 人确认`}</button></section>
-            {week.warnings.length > 0 && <WarningPanel warnings={week.warnings.slice(0, 4)} onMore={() => setTab("schedule")} />}
-          </TabsContent>
-
-          <TabsContent value="availability" className="tab-panel">
-            <div className="section-heading"><div><p className="section-kicker">01 / AVAILABILITY</p><h2>本周人员状态</h2></div><button className="small-action" onClick={confirmFullTime}><Check />全职全部正常</button></div>
-            <div className="legend"><span>点击日期切换：</span>{statusCycle.map((item) => <i key={item} className={`status-${item}`}>{statusLabel[item]}</i>)}</div>
-            <div className="people-list">{activeStaff.map((person) => {
-              const row = week.availability[person.id] ?? Array<Availability>(7).fill("unconfirmed");
-              const complete = row.every((value) => value !== "unconfirmed");
-              return <article className="availability-card" key={person.id}><div className="person-line"><button onClick={() => setEditingStaff(person)} className="person-name"><b>{person.name}</b><span>{person.store} · {person.employment}{person.role}</span></button><div className={`completion-dot ${complete ? "done" : ""}`}>{complete ? <Check /> : "!"}</div></div><div className="day-grid">{days.map((day, index) => <button key={day} onClick={() => cycleStatus(person.id, index)} className={`day-status status-${row[index]}`}><small>{day.slice(1)}</small><b>{statusLabel[row[index]]}</b></button>)}</div><div className="quick-row"><button onClick={() => setPersonWeek(person.id, "all")}>整周可排</button><button onClick={() => setPersonWeek(person.id, "off")}>本周排休</button></div></article>;
-            })}</div>
-          </TabsContent>
-
-          <TabsContent value="schedule" className="tab-panel">
-            <div className="section-heading"><div><p className="section-kicker">02 / SCHEDULE</p><h2>两店周班表</h2></div><button className="small-action accent" onClick={() => { setMiddleDraft((draft) => ({ ...draft, day: dayIndex })); setMiddleOpen(true); }}><Plus />加中班</button></div>
-            <div className="day-tabs">{days.map((day, index) => <button key={day} onClick={() => setDayIndex(index)} className={dayIndex === index ? "active" : ""}><b>{day}</b><span>{new Date(weekStart.getFullYear(), weekStart.getMonth(), weekStart.getDate() + index).getDate()}</span></button>)}</div>
-            <div className="store-stack">{stores.map((store, storeIndex) => <StoreSchedule key={store} store={store} storeIndex={storeIndex} day={dayIndex} weekAssignments={week.assignments} staff={state.staff} onSlot={setEditingSlotId} />)}</div>
-            <div className="schedule-actions"><button onClick={runSchedule}><Sparkles />重新排未锁定班次</button><button className={week.published ? "published" : ""} onClick={() => updateWeek((current) => ({ ...current, published: !current.published }))}>{week.published ? <Check /> : <Clock3 />}{week.published ? "本周已确认" : "确认本周班表"}</button></div>
-            {week.warnings.length > 0 && <WarningPanel warnings={week.warnings} />}
-          </TabsContent>
-
-          <TabsContent value="team" className="tab-panel">
-            <div className="section-heading"><div><p className="section-kicker">03 / TEAM</p><h2>人员与工时</h2></div></div>
-            <div className="team-grid">{state.staff.map((person) => <button key={person.id} onClick={() => setEditingStaff(person)} className={`team-card ${person.active ? "" : "inactive"}`}><span className={`role-badge role-${person.role.toLowerCase()}`}>{person.role}</span><b>{person.name}</b><small>{person.store} · {person.employment}</small><strong>{(staffHours.get(person.id) ?? 0).toFixed(2)}<em>h</em></strong>{person.novice && !person.mature && <i>新员工</i>}</button>)}</div>
-          </TabsContent>
+          <TabsContent value="home" className="tab-panel"><HomePanel period={period} confirmed={confirmed} unconfirmed={unconfirmed} excluded={excluded} activeCount={activeStaff.length} hardWarnings={hardWarnings} softWarnings={softWarnings} onAvailability={() => setTab("availability")} onDemand={() => setTab("demand")} onSchedule={runSchedule} onWarnings={() => { setTab("schedule"); setScheduleView("daily"); }} onEditPeriod={openEditPeriod} /></TabsContent>
+          <TabsContent value="availability" className="tab-panel"><AvailabilityPanel period={period} dates={dates} staff={activeStaff} onEdit={(staffId, day) => { const existing = period.customTimes[staffId]?.[day]?.[0]; setCustomDraft(existing ?? { start: "12:00", end: "18:00" }); setAvailabilityEditor({ staffId, day }); }} onWhole={setWholePeriod} onConfirm={confirmPerson} onParticipation={setParticipation} /></TabsContent>
+          <TabsContent value="demand" className="tab-panel"><DemandPanel period={period} dates={dates} dayIndex={dayIndex} onDay={setDayIndex} onAdd={() => { setMiddleDraft({ day: dayIndex, store: "星光店", name: "中班", requirement: "ANY", headcount: 1, start: "12:00", end: "18:00", note: "" }); setMiddleOpen(true); }} onDelete={deleteMiddle} /></TabsContent>
+          <TabsContent value="schedule" className="tab-panel"><SchedulePanel period={period} dates={dates} staff={state.staff} dayIndex={dayIndex} onDay={setDayIndex} view={scheduleView} onView={setScheduleView} onSlot={setEditingSlotId} onRun={runSchedule} onUndo={undo} canUndo={canUndo} onPublish={publish} hardWarnings={hardWarnings} onExportImage={exportImage} onExportExcel={exportExcel} /></TabsContent>
+          <TabsContent value="team" className="tab-panel"><TeamPanel staff={state.staff} hours={staffHours} onAdd={() => setAddingStaff(true)} onEdit={setEditingStaff} /></TabsContent>
         </div>
-        <TabsList className="bottom-nav"><TabsTrigger value="home"><CalendarDays /><span>总览</span></TabsTrigger><TabsTrigger value="availability"><CircleUserRound /><span>可排时间</span></TabsTrigger><TabsTrigger value="schedule"><Clock3 /><span>班表</span></TabsTrigger><TabsTrigger value="team"><UsersRound /><span>人员</span></TabsTrigger></TabsList>
+        <TabsList className="bottom-nav"><TabsTrigger value="home"><LayoutGrid /><span>首页</span></TabsTrigger><TabsTrigger value="availability"><ClipboardCheck /><span>可排时间</span></TabsTrigger><TabsTrigger value="demand"><Clock3 /><span>班次需求</span></TabsTrigger><TabsTrigger value="schedule"><CalendarDays /><span>班表</span></TabsTrigger><TabsTrigger value="team"><UsersRound /><span>人员</span></TabsTrigger></TabsList>
       </Tabs>
 
+      <Dialog open={periodOpen} onOpenChange={setPeriodOpen}><DialogContent className="editor-dialog"><PeriodEditor draft={periodDraft} setDraft={setPeriodDraft} editing={periodEditing} onSave={savePeriod} /></DialogContent></Dialog>
+      <Dialog open={moreOpen} onOpenChange={setMoreOpen}><DialogContent className="editor-dialog"><DialogHeader><DialogTitle>周期与工具</DialogTitle><DialogDescription>管理日期、历史记录和导出。</DialogDescription></DialogHeader><div className="menu-grid"><button onClick={() => { setMoreOpen(false); openNewPeriod(); }}><Plus />新建周期</button><button onClick={() => { setMoreOpen(false); openEditPeriod(); }}><Settings2 />编辑当前周期</button><button onClick={() => { setMoreOpen(false); setActivityOpen(true); }}><History />操作记录</button><button onClick={exportImage}><ImageDown />生成长图</button><button onClick={exportExcel}><FileSpreadsheet />导出Excel</button><button onClick={undo} disabled={!canUndo}><RotateCcw />撤销上一项</button></div><div className="period-list"><b>历史周期</b>{Object.entries(state.periods).sort((a, b) => b[1].startDate.localeCompare(a[1].startDate)).map(([key, item]) => <button key={key} className={key === periodKey ? "active" : ""} onClick={() => { setPeriodKey(key); setMoreOpen(false); setDayIndex(0); }}><span>{item.title}<small>{shortDate(item.startDate)}—{shortDate(item.endDate)}</small></span><i>{item.status === "published" ? `V${item.version}` : "草稿"}</i></button>)}</div></DialogContent></Dialog>
+      <Dialog open={activityOpen} onOpenChange={setActivityOpen}><DialogContent className="editor-dialog"><DialogHeader><DialogTitle>操作记录</DialogTitle><DialogDescription>最近200项修改都会保留。</DialogDescription></DialogHeader><div className="activity-list">{period.activities.length ? period.activities.map((item) => <div key={item.id}><b>{item.label}</b><small>{new Date(item.at).toLocaleString("zh-CN")}</small></div>) : <p className="empty-copy">还没有操作记录。</p>}</div></DialogContent></Dialog>
+      <Dialog open={!!availabilityEditor} onOpenChange={(open) => !open && setAvailabilityEditor(null)}><DialogContent className="editor-dialog">{availabilityEditor && <AvailabilityEditor staff={state.staff.find((person) => person.id === availabilityEditor.staffId)!} date={dates[availabilityEditor.day]} value={period.availability[availabilityEditor.staffId]?.[availabilityEditor.day] ?? "unconfirmed"} custom={customDraft} setCustom={setCustomDraft} onSelect={(value) => { if (value === "custom") return; setAvailability(availabilityEditor.staffId, availabilityEditor.day, value); setAvailabilityEditor(null); }} onSaveCustom={saveCustomTime} />}</DialogContent></Dialog>
+      <Dialog open={middleOpen} onOpenChange={setMiddleOpen}><DialogContent className="editor-dialog"><MiddleEditor draft={middleDraft} setDraft={setMiddleDraft} dates={dates} onSave={addMiddle} /></DialogContent></Dialog>
+      <Dialog open={!!editingSlot} onOpenChange={(open) => !open && setEditingSlotId(null)}><DialogContent className="editor-dialog">{editingSlot && <SlotEditor slot={editingSlot} date={dates[editingSlot.day]} candidates={candidateStaff} onSave={updateSlot} />}</DialogContent></Dialog>
       <Dialog open={!!editingStaff} onOpenChange={(open) => !open && setEditingStaff(null)}><DialogContent className="editor-dialog">{editingStaff && <StaffEditor person={editingStaff} onSave={updateStaff} />}</DialogContent></Dialog>
-      <Dialog open={middleOpen} onOpenChange={setMiddleOpen}><DialogContent className="editor-dialog"><DialogHeader><DialogTitle>增加中班</DialogTitle><DialogDescription>默认 12:00–18:00，可指定需要 SS 或 BB。</DialogDescription></DialogHeader><div className="form-grid"><label>日期<select value={middleDraft.day} onChange={(e) => setMiddleDraft({ ...middleDraft, day: Number(e.target.value) })}>{days.map((day, index) => <option key={day} value={index}>{day}</option>)}</select></label><label>门店<select value={middleDraft.store} onChange={(e) => setMiddleDraft({ ...middleDraft, store: e.target.value as Store })}>{stores.map((store) => <option key={store}>{store}</option>)}</select></label><label>需要角色<select value={middleDraft.role} onChange={(e) => setMiddleDraft({ ...middleDraft, role: e.target.value as Role })}><option>SS</option><option>BB</option></select></label><label>开始<input type="time" value={middleDraft.start} onChange={(e) => setMiddleDraft({ ...middleDraft, start: e.target.value })} /></label><label>结束<input type="time" value={middleDraft.end} onChange={(e) => setMiddleDraft({ ...middleDraft, end: e.target.value })} /></label></div><button className="dialog-submit" onClick={addMiddle}>添加中班</button></DialogContent></Dialog>
-      <Dialog open={!!editingSlot} onOpenChange={(open) => !open && setEditingSlotId(null)}><DialogContent className="editor-dialog">{editingSlot && <><DialogHeader><DialogTitle>调整{shiftLabel(editingSlot.shift)}</DialogTitle><DialogDescription>{days[editingSlot.day]} · {editingSlot.store} · 需要 {editingSlot.role}</DialogDescription></DialogHeader><Select value={editingSlot.staffId ?? "empty"} onValueChange={(value) => updateSlot(value === "empty" ? null : value)}><SelectTrigger className="assignment-select"><SelectValue placeholder="选择员工" /></SelectTrigger><SelectContent><SelectItem value="empty">暂时空缺</SelectItem>{candidates.map((person) => <SelectItem value={person.id} key={person.id}>{person.name} · {person.store}</SelectItem>)}</SelectContent></Select><label className="switch-line"><span><b>锁定这个班次</b><small>重新排班时保留当前安排</small></span><Switch checked={editingSlot.locked} onCheckedChange={(locked) => updateSlot(editingSlot.staffId, locked)} /></label></>}</DialogContent></Dialog>
+      <Dialog open={addingStaff} onOpenChange={setAddingStaff}><DialogContent className="editor-dialog"><StaffEditor person={{ id: "new-staff", name: "", store: "星光店", role: "BB", employment: "兼职", active: true }} adding onSave={addStaff} /></DialogContent></Dialog>
     </main>
   );
 }
 
-function WarningPanel({ warnings, onMore }: { warnings: string[]; onMore?: () => void }) {
-  return <section className="warning-panel"><div className="warning-head"><AlertTriangle /><b>排班提醒</b><span>{warnings.length}</span></div>{warnings.map((warning) => <p key={warning}>{warning}</p>)}{onMore && <button onClick={onMore}>查看全部提醒</button>}</section>;
+function HomePanel({ period, confirmed, unconfirmed, excluded, activeCount, hardWarnings, softWarnings, onAvailability, onDemand, onSchedule, onWarnings, onEditPeriod }: { period: PeriodState; confirmed: number; unconfirmed: number; excluded: number; activeCount: number; hardWarnings: string[]; softWarnings: string[]; onAvailability: () => void; onDemand: () => void; onSchedule: () => void; onWarnings: () => void; onEditPeriod: () => void }) {
+  const filled = period.assignments.filter((item) => item.staffId).length;
+  return <><section className="dashboard-grid"><article className="hero-card color-wine"><div className="lamp-geometry" aria-hidden="true"><span /><i /></div><p>信息收集进度</p><strong>{confirmed}<em> / {activeCount}</em></strong><span>未确认 {unconfirmed} 人 · 不参与 {excluded} 人</span><button className="primary-action" onClick={onAvailability}>继续录入</button></article><article className="metric-card color-blue"><CalendarDays /><b>{filled}</b><span>已安排人次</span></article><article className="metric-card color-orange"><AlertTriangle /><b>{hardWarnings.length}</b><span>硬规则问题</span></article></section>
+    <section className="period-card"><div><span>当前周期</span><b>{shortDate(period.startDate)}—{shortDate(period.endDate)}</b><small>{dateList(period.startDate, period.endDate).length}天 · {period.deadline ? `截止提醒 ${new Date(period.deadline).toLocaleString("zh-CN")}` : "未设置截止提醒"}</small></div><button onClick={onEditPeriod}>编辑日期</button></section>
+    <section className="shortcut-grid"><button onClick={onAvailability}><ClipboardCheck /><b>录入可排时间</b><span>还有{unconfirmed}人待确认</span></button><button onClick={onDemand}><Clock3 /><b>设置中班</b><span>已有{period.middleShifts.length}个中班</span></button><button onClick={onSchedule}><Sparkles /><b>自动排班</b><span>生成当前周期草稿</span></button><button onClick={onWarnings}><ListChecks /><b>查看问题</b><span>{hardWarnings.length + softWarnings.length}条提醒</span></button></section>
+    {(hardWarnings.length > 0 || softWarnings.length > 0) && <WarningPanel warnings={[...hardWarnings, ...softWarnings].slice(0, 5)} onMore={onWarnings} />}</>;
 }
 
-function StoreSchedule({ store, storeIndex, day, weekAssignments, staff, onSlot }: { store: Store; storeIndex: number; day: number; weekAssignments: Assignment[]; staff: Staff[]; onSlot: (id: string) => void }) {
-  const today = weekAssignments.filter((item) => item.day === day && item.store === store);
-  return <article className={`store-card store-${storeIndex}`}><div className="store-head"><div><StoreIcon /><b>{store}</b></div><span>{today.filter((item) => item.staffId).length} 人</span></div><div className="shift-list">{(["early", "middle", "late"] as const).map((shift) => {
-    const slots = today.filter((item) => item.shift === shift);
-    if (shift === "middle" && !slots.length) return null;
-    const fallback = store === "星光店" ? (shift === "early" ? "07:15" : "13:15") : (shift === "early" ? "06:15" : "14:30");
-    return <div className="shift-row" key={shift}><div className="shift-time"><b>{shiftLabel(shift)}</b><span>{slots[0]?.start ?? fallback}</span></div><div className="slot-group">{slots.map((slot) => { const person = staff.find((item) => item.id === slot.staffId); return <button key={slot.id} onClick={() => onSlot(slot.id)} className={`staff-slot ${person ? "filled" : "empty"}`}><i>{slot.role}</i><b>{person?.name ?? `缺${slot.role}`}</b>{slot.locked && <Lock />}</button>; })}</div></div>;
-  })}</div></article>;
+function AvailabilityPanel({ period, dates, staff, onEdit, onWhole, onConfirm, onParticipation }: { period: PeriodState; dates: string[]; staff: Staff[]; onEdit: (staffId: string, day: number) => void; onWhole: (staffId: string, value: Availability) => void; onConfirm: (staffId: string) => void; onParticipation: (staffId: string, value: Participation) => void }) {
+  return <><div className="section-heading"><div><p className="section-kicker">01 / AVAILABILITY</p><h2>人员可排时间</h2><p>点击某天，一次选择白班、晚班或休息。</p></div></div><div className="legend">{availabilityOptions.map((item) => <i key={item.value} className={`status-${item.value}`}>{item.short}</i>)}</div><div className="people-list">{staff.map((person) => { const row = period.availability[person.id] ?? []; const status = period.participation[person.id] ?? "unconfirmed"; return <article className="availability-card" key={person.id}><div className="person-line"><div className="person-name"><b>{person.name}</b><span>{person.store} · {person.employment}{person.role}</span></div><span className={`participation participation-${status}`}>{participationLabel[status]}</span></div>{status !== "excluded" && <div className="date-status-scroll">{dates.map((date, index) => <button key={date} onClick={() => onEdit(person.id, index)} className={`date-status status-${row[index] ?? "unconfirmed"}`}><small>{dateLabel(date)}</small><b>{statusLabel[row[index] ?? "unconfirmed"]}</b></button>)}</div>}<div className="quick-row"><button onClick={() => onWhole(person.id, "all")}>全周期可排</button><button onClick={() => onWhole(person.id, "off")}>全周期休息</button>{status === "excluded" ? <button onClick={() => onParticipation(person.id, "unconfirmed")}>恢复参与</button> : <button onClick={() => onParticipation(person.id, "excluded")}>本期不参与</button>}</div>{status !== "excluded" && <button className={`confirm-person ${status === "confirmed" ? "done" : ""}`} onClick={() => onConfirm(person.id)}>{status === "confirmed" ? <><Check />已确认，点击重新检查</> : <><ClipboardCheck />完成录入并确认</>}</button>}</article>; })}</div></>;
 }
 
-function StaffEditor({ person, onSave }: { person: Staff; onSave: (person: Staff) => void }) {
-  const [draft, setDraft] = useState(person);
-  return <><DialogHeader><DialogTitle>编辑人员条件</DialogTitle><DialogDescription>门店、角色、用工类型和新员工状态都可以随时修改。</DialogDescription></DialogHeader><div className="form-grid"><label className="wide">姓名<input value={draft.name} onChange={(e) => setDraft({ ...draft, name: e.target.value })} /></label><label>所属门店<select value={draft.store} onChange={(e) => setDraft({ ...draft, store: e.target.value as Store })}>{stores.map((store) => <option key={store}>{store}</option>)}</select></label><label>角色<select value={draft.role} onChange={(e) => setDraft({ ...draft, role: e.target.value as Role })}><option>SS</option><option>BB</option></select></label><label>类型<select value={draft.employment} onChange={(e) => setDraft({ ...draft, employment: e.target.value as Staff["employment"] })}><option>全职</option><option>兼职</option></select></label></div><label className="switch-line"><span><b>当前启用</b><small>关闭后不会参与排班</small></span><Switch checked={draft.active} onCheckedChange={(active) => setDraft({ ...draft, active })} /></label>{draft.role === "BB" && <label className="switch-line"><span><b>新员工已成熟</b><small>开启后可由兼职 SS 带班</small></span><Switch checked={draft.mature ?? false} onCheckedChange={(mature) => setDraft({ ...draft, novice: true, mature })} /></label>}<button className="dialog-submit" onClick={() => onSave(draft)}>保存人员资料</button></>;
+function DemandPanel({ period, dates, dayIndex, onDay, onAdd, onDelete }: { period: PeriodState; dates: string[]; dayIndex: number; onDay: (day: number) => void; onAdd: () => void; onDelete: (id: string) => void }) {
+  return <><div className="section-heading"><div><p className="section-kicker">02 / SHIFT NEEDS</p><h2>班次需求</h2><p>基础班固定两人，中班可以增加1—2人。</p></div><button className="small-action accent" onClick={onAdd}><Plus />加中班</button></div><DateStrip dates={dates} active={dayIndex} onChange={onDay} /><div className="store-stack">{stores.map((store, storeIndex) => <article className={`store-card store-${storeIndex}`} key={store}><div className="store-head"><div><StoreIcon /><b>{store}</b></div><span>基础4人</span></div><div className="demand-body">{(["early", "late"] as const).map((shift) => <div className="base-demand" key={shift}><span><b>{shiftLabel(shift)}</b><small>{shiftTimes[store][shift][0]}—{shiftTimes[store][shift][1]}</small></span><i>1 SS ＋ 1 BB</i></div>)}{period.middleShifts.filter((item) => item.day === dayIndex && item.store === store).map((item) => <div className="middle-demand" key={item.id}><span><b>{item.name}</b><small>{item.start}—{item.end} · {item.headcount}人 · {requirementLabel(item.requirement)}</small></span><button onClick={() => onDelete(item.id)}>删除</button></div>)}{!period.middleShifts.some((item) => item.day === dayIndex && item.store === store) && <p className="empty-copy">当天没有额外中班。</p>}</div></article>)}</div></>;
 }
+
+function SchedulePanel({ period, dates, staff, dayIndex, onDay, view, onView, onSlot, onRun, onUndo, canUndo, onPublish, hardWarnings, onExportImage, onExportExcel }: { period: PeriodState; dates: string[]; staff: Staff[]; dayIndex: number; onDay: (day: number) => void; view: "daily" | "week" | "period"; onView: (view: "daily" | "week" | "period") => void; onSlot: (id: string) => void; onRun: () => void; onUndo: () => void; canUndo: boolean; onPublish: () => void; hardWarnings: string[]; onExportImage: () => void; onExportExcel: () => void }) {
+  const shownDates = view === "week" ? dates.slice(Math.floor(dayIndex / 7) * 7, Math.floor(dayIndex / 7) * 7 + 7) : dates;
+  return <><div className="section-heading"><div><p className="section-kicker">03 / SCHEDULE</p><h2>两店班表</h2><p>{period.status === "published" ? `已发布 V${period.version}` : period.status === "adjusted" ? "已发布后存在临时调整" : "排班草稿"}</p></div></div><div className="view-switch"><button className={view === "daily" ? "active" : ""} onClick={() => onView("daily")}>每日班表</button><button className={view === "week" ? "active" : ""} onClick={() => onView("week")}>周视图</button><button className={view === "period" ? "active" : ""} onClick={() => onView("period")}>周期总览</button></div>
+    {view === "daily" ? <><DateStrip dates={dates} active={dayIndex} onChange={onDay} /><div className="store-stack">{stores.map((store, index) => <StoreSchedule key={store} store={store} storeIndex={index} day={dayIndex} assignments={period.assignments} staff={staff} onSlot={onSlot} />)}</div></> : <RosterTable dates={shownDates} allDates={dates} staff={staff} assignments={period.assignments} />}
+    <div className="schedule-toolbar"><button onClick={onRun}><Sparkles />自动排班</button><button onClick={onUndo} disabled={!canUndo}><RotateCcw />撤销</button><button onClick={onExportImage}><ImageDown />长图</button><button onClick={onExportExcel}><Download />Excel</button></div>
+    <button className={`publish-button ${period.status === "published" ? "published" : ""}`} disabled={hardWarnings.length > 0} onClick={onPublish}>{hardWarnings.length ? `先处理 ${hardWarnings.length} 个硬规则问题` : period.status === "published" ? <><Lock />班表已发布并锁定</> : <><Check />发布并锁定班表</>}</button>
+    {period.warnings.length > 0 && <WarningPanel warnings={period.warnings} />}</>;
+}
+
+function TeamPanel({ staff, hours, onAdd, onEdit }: { staff: Staff[]; hours: Map<string, number>; onAdd: () => void; onEdit: (staff: Staff) => void }) {
+  return <><div className="section-heading"><div><p className="section-kicker">04 / TEAM</p><h2>人员与工时</h2><p>新增员工、调整门店或停用人员。</p></div><button className="small-action accent" onClick={onAdd}><UserPlus />添加员工</button></div><div className="team-grid">{staff.map((person) => <button key={person.id} onClick={() => onEdit(person)} className={`team-card ${person.active ? "" : "inactive"}`}><span className={`role-badge role-${person.role.toLowerCase()}`}>{person.role}</span><b>{person.name}</b><small>{person.store} · {person.employment}</small><strong>{(hours.get(person.id) ?? 0).toFixed(2)}<em>h</em></strong>{person.novice && !person.mature && <i>新员工</i>}{!person.active && <i>已停用</i>}</button>)}</div></>;
+}
+
+function DateStrip({ dates, active, onChange }: { dates: string[]; active: number; onChange: (day: number) => void }) { return <div className="date-strip">{dates.map((date, index) => <button key={date} className={index === active ? "active" : ""} onClick={() => onChange(index)}><b>{dateLabel(date).split(" ")[1]}</b><span>{parseDate(date).getDate()}</span><small>{parseDate(date).getMonth() + 1}月</small></button>)}</div>; }
+
+function StoreSchedule({ store, storeIndex, day, assignments, staff, onSlot }: { store: Store; storeIndex: number; day: number; assignments: Assignment[]; staff: Staff[]; onSlot: (id: string) => void }) {
+  const today = assignments.filter((item) => item.day === day && item.store === store);
+  return <article className={`store-card store-${storeIndex}`}><div className="store-head"><div><StoreIcon /><b>{store}</b></div><span>{today.filter((item) => item.staffId).length}人已排</span></div><div className="shift-list">{(["early", "middle", "late"] as const).map((shift) => { const slots = today.filter((item) => item.shift === shift); if (shift === "middle" && !slots.length) return null; return <div className="shift-row" key={shift}><div className="shift-time"><b>{shiftLabel(shift)}</b><span>{slots[0] ? `${slots[0].start}—${slots[0].end}` : "待生成"}</span></div><div className="slot-group">{slots.length ? slots.map((slot) => { const person = staff.find((item) => item.id === slot.staffId); return <button key={slot.id} onClick={() => onSlot(slot.id)} className={`staff-slot ${person ? "filled" : "empty"}`}><i>{slot.role === "ANY" ? "人" : slot.role}</i><span><b>{person?.name ?? `缺${slot.role === "ANY" ? "1人" : slot.role}`}</b>{person && <small>{person.store === store ? person.employment : `${person.store}支援`}</small>}</span>{slot.locked && <Lock />}</button>; }) : <p className="empty-copy">请先生成班表</p>}</div></div>; })}</div></article>;
+}
+
+function RosterTable({ dates, allDates, staff, assignments }: { dates: string[]; allDates: string[]; staff: Staff[]; assignments: Assignment[] }) {
+  return <div className="roster-wrap"><table className="roster-table"><thead><tr><th>员工</th>{dates.map((date) => <th key={date}>{dateLabel(date)}</th>)}<th>工时</th></tr></thead><tbody>{staff.filter((person) => person.active).map((person) => { const personAssignments = assignments.filter((item) => item.staffId === person.id); return <tr key={person.id}><th><b>{person.name}</b><small>{person.role} · {person.store}</small></th>{dates.map((date) => { const day = allDates.indexOf(date); const item = personAssignments.find((slot) => slot.day === day); return <td key={date} className={item ? `cell-${item.store === "星光店" ? "blue" : "green"}` : ""}>{item ? <><b>{item.store.slice(0, 2)}</b><span>{shiftLabel(item.shift)}</span></> : <span className="rest-cell">休</span>}</td>; })}<td><b>{personAssignments.reduce((sum, item) => sum + hoursFor(item), 0).toFixed(2)}</b></td></tr>; })}</tbody></table></div>;
+}
+
+function WarningPanel({ warnings, onMore }: { warnings: string[]; onMore?: () => void }) { return <section className="warning-panel"><div className="warning-head"><AlertTriangle /><b>排班提醒</b><span>{warnings.length}</span></div>{warnings.map((warning, index) => <p className={warning.startsWith("【硬】") ? "hard" : "soft"} key={`${warning}-${index}`}>{warning}</p>)}{onMore && <button onClick={onMore}>查看全部提醒</button>}</section>; }
+
+function PeriodEditor({ draft, setDraft, editing, onSave }: { draft: { title: string; startDate: string; endDate: string; deadline: string }; setDraft: (draft: { title: string; startDate: string; endDate: string; deadline: string }) => void; editing: boolean; onSave: () => void }) { return <><DialogHeader><DialogTitle>{editing ? "编辑排班周期" : "新建排班周期"}</DialogTitle><DialogDescription>日期范围可以是任意天数，也可以跨周、跨月。</DialogDescription></DialogHeader><div className="form-grid"><label className="wide">周期名称<input value={draft.title} onChange={(event) => setDraft({ ...draft, title: event.target.value })} placeholder="留空将按日期生成" /></label><label>开始日期<input type="date" value={draft.startDate} onChange={(event) => setDraft({ ...draft, startDate: event.target.value })} /></label><label>结束日期<input type="date" min={draft.startDate} value={draft.endDate} onChange={(event) => setDraft({ ...draft, endDate: event.target.value })} /></label><label className="wide">收集截止提醒<input type="datetime-local" value={draft.deadline} onChange={(event) => setDraft({ ...draft, deadline: event.target.value })} /></label></div><button className="dialog-submit" onClick={onSave}>{editing ? "保存周期设置" : "创建并开始录入"}</button></>; }
+
+function AvailabilityEditor({ staff, date, value, custom, setCustom, onSelect, onSaveCustom }: { staff: Staff; date: string; value: Availability; custom: TimeWindow; setCustom: (value: TimeWindow) => void; onSelect: (value: Availability) => void; onSaveCustom: () => void }) { return <><DialogHeader><DialogTitle>{staff.name} · {dateLabel(date)}</DialogTitle><DialogDescription>直接点选，不需要反复切换。</DialogDescription></DialogHeader><div className="status-rail">{availabilityOptions.filter((item) => item.value !== "custom").map((item) => <button key={item.value} onClick={() => onSelect(item.value)} className={`status-${item.value} ${value === item.value ? "selected" : ""}`}><b>{item.short}</b><span>{item.label}</span></button>)}</div><div className="custom-time-box"><b>自定义可上时间</b><div><label>开始<input type="time" value={custom.start} onChange={(event) => setCustom({ ...custom, start: event.target.value })} /></label><label>结束<input type="time" value={custom.end} onChange={(event) => setCustom({ ...custom, end: event.target.value })} /></label></div><button onClick={onSaveCustom}>保存自定义时间</button></div></>; }
+
+function MiddleEditor({ draft, setDraft, dates, onSave }: { draft: Omit<MiddleShift, "id">; setDraft: (value: Omit<MiddleShift, "id">) => void; dates: string[]; onSave: () => void }) { return <><DialogHeader><DialogTitle>添加中班</DialogTitle><DialogDescription>时间、人数和角色要求都可以自由设置。</DialogDescription></DialogHeader><div className="form-grid"><label>日期<select value={draft.day} onChange={(event) => setDraft({ ...draft, day: Number(event.target.value) })}>{dates.map((date, index) => <option value={index} key={date}>{dateLabel(date)}</option>)}</select></label><label>门店<select value={draft.store} onChange={(event) => setDraft({ ...draft, store: event.target.value as Store })}>{stores.map((store) => <option key={store}>{store}</option>)}</select></label><label className="wide">名称<input value={draft.name} onChange={(event) => setDraft({ ...draft, name: event.target.value })} /></label><label>开始<input type="time" value={draft.start} onChange={(event) => setDraft({ ...draft, start: event.target.value })} /></label><label>结束<input type="time" value={draft.end} onChange={(event) => setDraft({ ...draft, end: event.target.value })} /></label><label>需要人数<select value={draft.headcount} onChange={(event) => setDraft({ ...draft, headcount: Number(event.target.value) as 1 | 2 })}><option value={1}>1人</option><option value={2}>2人</option></select></label><label>人员要求<select value={draft.requirement} onChange={(event) => setDraft({ ...draft, requirement: event.target.value as MiddleShift["requirement"], headcount: event.target.value === "SS_BB" ? 2 : draft.headcount })}><option value="ANY">身份不限</option><option value="SS">至少1名SS</option><option value="BB">至少1名BB</option><option value="SS_BB">1SS＋1BB</option></select></label><label className="wide">备注<input value={draft.note ?? ""} onChange={(event) => setDraft({ ...draft, note: event.target.value })} placeholder="例如：周末高峰" /></label></div><button className="dialog-submit" onClick={onSave}>保存中班</button></>; }
+
+function SlotEditor({ slot, date, candidates, onSave }: { slot: Assignment; date: string; candidates: Staff[]; onSave: (staffId: string | null) => void }) { return <><DialogHeader><DialogTitle>调整{shiftLabel(slot.shift)}</DialogTitle><DialogDescription>{dateLabel(date)} · {slot.store} · 需要{slot.role === "ANY" ? "1人" : slot.role}</DialogDescription></DialogHeader><div className="candidate-list"><button onClick={() => onSave(null)} className="empty-candidate">暂时空缺</button>{candidates.map((person) => <button key={person.id} onClick={() => onSave(person.id)}><span><b>{person.name}</b><small>{person.store} · {person.employment}{person.role}</small></span>{person.store !== slot.store && <i>跨店</i>}</button>)}</div></>; }
+
+function StaffEditor({ person, adding, onSave }: { person: Staff; adding?: boolean; onSave: (person: Staff) => void }) { const [draft, setDraft] = useState(person); return <><DialogHeader><DialogTitle>{adding ? "添加新员工" : "编辑人员条件"}</DialogTitle><DialogDescription>人员状态可以随时修改，停用后仍保留历史班表。</DialogDescription></DialogHeader><div className="form-grid"><label className="wide">姓名<input value={draft.name} onChange={(event) => setDraft({ ...draft, name: event.target.value })} /></label><label>所属门店<select value={draft.store} onChange={(event) => setDraft({ ...draft, store: event.target.value as Store })}>{stores.map((store) => <option key={store}>{store}</option>)}</select></label><label>角色<select value={draft.role} onChange={(event) => setDraft({ ...draft, role: event.target.value as Role })}><option>SS</option><option>BB</option></select></label><label>类型<select value={draft.employment} onChange={(event) => setDraft({ ...draft, employment: event.target.value as Staff["employment"] })}><option>全职</option><option>兼职</option></select></label><label>个人偏好<select value={draft.preference ?? "none"} onChange={(event) => setDraft({ ...draft, preference: event.target.value === "early" ? "early" : undefined })}><option value="none">无特别偏好</option><option value="early">优先白班</option></select></label><label className="wide">备注<input value={draft.note ?? ""} onChange={(event) => setDraft({ ...draft, note: event.target.value })} /></label></div><label className="switch-line"><span><b>当前启用</b><small>关闭后不参与新周期排班</small></span><Switch checked={draft.active} onCheckedChange={(active) => setDraft({ ...draft, active })} /></label><label className="switch-line"><span><b>新员工</b><small>成熟前优先由全职SS带班</small></span><Switch checked={draft.novice ?? false} onCheckedChange={(novice) => setDraft({ ...draft, novice, mature: novice ? draft.mature : false })} /></label>{draft.novice && <label className="switch-line"><span><b>已经成熟</b><small>开启后取消全职SS优先提醒</small></span><Switch checked={draft.mature ?? false} onCheckedChange={(mature) => setDraft({ ...draft, mature })} /></label>}<label className="switch-line"><span><b>允许跨店支援</b><small>缺人时加入另一家店候选名单</small></span><Switch checked={draft.canCrossStore ?? true} onCheckedChange={(canCrossStore) => setDraft({ ...draft, canCrossStore })} /></label><button className="dialog-submit" disabled={!draft.name.trim()} onClick={() => onSave({ ...draft, name: draft.name.trim() })}>{adding ? "添加并开始使用" : "保存人员资料"}</button></>; }
+
+function requirementLabel(value: MiddleShift["requirement"]) { return value === "ANY" ? "身份不限" : value === "SS_BB" ? "1SS＋1BB" : `至少1名${value}`; }
+function downloadBlob(blob: Blob, filename: string) { const url = URL.createObjectURL(blob); const link = document.createElement("a"); link.href = url; link.download = filename; link.click(); setTimeout(() => URL.revokeObjectURL(url), 1000); }
+function previousPeriodKey(state: AppState, current: string, offset: -1 | 1) { const entries = Object.entries(state.periods).sort((a, b) => a[1].startDate.localeCompare(b[1].startDate)); const index = entries.findIndex(([key]) => key === current); return entries[index + offset]?.[0]; }
