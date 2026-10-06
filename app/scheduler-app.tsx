@@ -1,7 +1,7 @@
 "use client";
 
 import { useEffect, useRef, useState } from "react";
-import { AlertTriangle, CalendarDays, Check, ChevronLeft, ChevronRight, ClipboardCheck, Clock3, Download, FileSpreadsheet, History, ImageDown, LayoutGrid, ListChecks, Lock, MoreHorizontal, Plus, RotateCcw, Settings2, Sparkles, Store as StoreIcon, UserPlus, UsersRound } from "lucide-react";
+import { AlertTriangle, CalendarDays, Check, ChevronLeft, ChevronRight, ClipboardCheck, Clock3, Copy, Download, FileSpreadsheet, History, ImageDown, LayoutGrid, ListChecks, Lock, MoreHorizontal, Plus, RotateCcw, Settings2, Sparkles, Store as StoreIcon, UserPlus, UsersRound } from "lucide-react";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { Dialog, DialogContent, DialogDescription, DialogHeader, DialogTitle } from "@/components/ui/dialog";
 import { Switch } from "@/components/ui/switch";
@@ -118,6 +118,17 @@ export function SchedulerApp() {
 
   const openNewPeriod = () => { const initialRange = todayRange(); setPeriodEditing(false); setPeriodDraft({ title: "", startDate: initialRange.startDate, endDate: initialRange.endDate, deadline: "" }); setPeriodOpen(true); };
   const openEditPeriod = () => { if (!period) return; setPeriodEditing(true); setPeriodDraft({ title: period.title, startDate: period.startDate, endDate: period.endDate, deadline: period.deadline ?? "" }); setPeriodOpen(true); };
+  const copyPeriodSettings = () => {
+    if (!period) return;
+    const periodLength = dateList(period.startDate, period.endDate).length;
+    const start = parseDate(period.endDate); start.setDate(start.getDate() + 1);
+    const end = new Date(start); end.setDate(end.getDate() + periodLength - 1);
+    const created = emptyPeriod(state.staff, isoDate(start), isoDate(end));
+    created.middleShifts = period.middleShifts.map((item) => ({ ...item, id: `middle-${Date.now()}-${Math.random()}` }));
+    created.activities = [makeActivity(`复制“${period.title}”的班次设置`)];
+    setState((current) => ({ ...current, periods: { ...current.periods, [created.id]: created } }));
+    setPeriodKey(created.id); setDayIndex(0); setMoreOpen(false);
+  };
   const savePeriod = () => {
     if (!periodDraft.startDate || !periodDraft.endDate || periodDraft.endDate < periodDraft.startDate) return;
     if (periodEditing && period) {
@@ -219,7 +230,7 @@ export function SchedulerApp() {
       </Tabs>
 
       <Dialog open={periodOpen} onOpenChange={setPeriodOpen}><DialogContent className="editor-dialog"><PeriodEditor draft={periodDraft} setDraft={setPeriodDraft} editing={periodEditing} onSave={savePeriod} /></DialogContent></Dialog>
-      <Dialog open={moreOpen} onOpenChange={setMoreOpen}><DialogContent className="editor-dialog"><DialogHeader><DialogTitle>周期与工具</DialogTitle><DialogDescription>管理日期、历史记录和导出。</DialogDescription></DialogHeader><div className="menu-grid"><button onClick={() => { setMoreOpen(false); openNewPeriod(); }}><Plus />新建周期</button><button onClick={() => { setMoreOpen(false); openEditPeriod(); }}><Settings2 />编辑当前周期</button><button onClick={() => { setMoreOpen(false); setActivityOpen(true); }}><History />操作记录</button><button onClick={exportImage}><ImageDown />生成长图</button><button onClick={exportExcel}><FileSpreadsheet />导出Excel</button><button onClick={undo} disabled={!canUndo}><RotateCcw />撤销上一项</button></div><div className="period-list"><b>历史周期</b>{Object.entries(state.periods).sort((a, b) => b[1].startDate.localeCompare(a[1].startDate)).map(([key, item]) => <button key={key} className={key === periodKey ? "active" : ""} onClick={() => { setPeriodKey(key); setMoreOpen(false); setDayIndex(0); }}><span>{item.title}<small>{shortDate(item.startDate)}—{shortDate(item.endDate)}</small></span><i>{item.status === "published" ? `V${item.version}` : "草稿"}</i></button>)}</div></DialogContent></Dialog>
+      <Dialog open={moreOpen} onOpenChange={setMoreOpen}><DialogContent className="editor-dialog"><DialogHeader><DialogTitle>周期与工具</DialogTitle><DialogDescription>管理日期、历史记录和导出。</DialogDescription></DialogHeader><div className="menu-grid"><button onClick={() => { setMoreOpen(false); openNewPeriod(); }}><Plus />新建周期</button><button onClick={copyPeriodSettings}><Copy />复制周期设置</button><button onClick={() => { setMoreOpen(false); openEditPeriod(); }}><Settings2 />编辑当前周期</button><button onClick={() => { setMoreOpen(false); setActivityOpen(true); }}><History />操作记录</button><button onClick={exportImage}><ImageDown />生成长图</button><button onClick={exportExcel}><FileSpreadsheet />导出Excel</button><button onClick={undo} disabled={!canUndo}><RotateCcw />撤销上一项</button></div><div className="period-list"><b>历史周期</b>{Object.entries(state.periods).sort((a, b) => b[1].startDate.localeCompare(a[1].startDate)).map(([key, item]) => <button key={key} className={key === periodKey ? "active" : ""} onClick={() => { setPeriodKey(key); setMoreOpen(false); setDayIndex(0); }}><span>{item.title}<small>{shortDate(item.startDate)}—{shortDate(item.endDate)}</small></span><i>{item.status === "published" ? `V${item.version}` : "草稿"}</i></button>)}</div></DialogContent></Dialog>
       <Dialog open={activityOpen} onOpenChange={setActivityOpen}><DialogContent className="editor-dialog"><DialogHeader><DialogTitle>操作记录</DialogTitle><DialogDescription>最近200项修改都会保留。</DialogDescription></DialogHeader><div className="activity-list">{period.activities.length ? period.activities.map((item) => <div key={item.id}><b>{item.label}</b><small>{new Date(item.at).toLocaleString("zh-CN")}</small></div>) : <p className="empty-copy">还没有操作记录。</p>}</div></DialogContent></Dialog>
       <Dialog open={!!availabilityEditor} onOpenChange={(open) => !open && setAvailabilityEditor(null)}><DialogContent className="editor-dialog">{availabilityEditor && <AvailabilityEditor staff={state.staff.find((person) => person.id === availabilityEditor.staffId)!} date={dates[availabilityEditor.day]} value={period.availability[availabilityEditor.staffId]?.[availabilityEditor.day] ?? "unconfirmed"} custom={customDraft} setCustom={setCustomDraft} onSelect={(value) => { if (value === "custom") return; setAvailability(availabilityEditor.staffId, availabilityEditor.day, value); setAvailabilityEditor(null); }} onSaveCustom={saveCustomTime} />}</DialogContent></Dialog>
       <Dialog open={middleOpen} onOpenChange={setMiddleOpen}><DialogContent className="editor-dialog"><MiddleEditor draft={middleDraft} setDraft={setMiddleDraft} dates={dates} onSave={addMiddle} /></DialogContent></Dialog>
