@@ -120,6 +120,7 @@ export function hoursFor(assignment: Assignment) { return Math.max(0, (minutes(a
 
 export function generateSchedule(staff: Staff[], period: PeriodState) {
   const dates = dateList(period.startDate, period.endDate);
+  const fullTimeTarget = Math.min(dates.length, Math.ceil(dates.length * 5 / 7));
   const active = staff.filter((person) => person.active && period.participation[person.id] !== "excluded");
   const unconfirmed = active.filter((person) => period.participation[person.id] !== "confirmed" || (period.availability[person.id] ?? []).some((value) => value === "unconfirmed"));
   if (unconfirmed.length) return { assignments: period.assignments, warnings: [`【硬】以下人员信息尚未确认：${unconfirmed.map((person) => person.name).join("、")}`] };
@@ -135,12 +136,47 @@ export function generateSchedule(staff: Staff[], period: PeriodState) {
   const assignments = [...standard, ...middle].map((slot) => { const existing = previous.get(slot.id); return existing?.locked ? { ...slot, staffId: existing.staffId, locked: true, start: existing.start, end: existing.end, customTime: existing.customTime } : slot; });
   const usedByDay = new Map<number, Set<string>>(); const workedDays = new Map<string, Set<number>>(); const counts = new Map<string, number>(); const shiftCounts = new Map<string, { early: number; late: number }>(); const lastShift = new Map<string, { day: number; shift: ShiftKind }>(); const warnings: string[] = [];
   const record = (slot: Assignment, staffId: string) => { if (!usedByDay.has(slot.day)) usedByDay.set(slot.day, new Set()); usedByDay.get(slot.day)!.add(staffId); if (!workedDays.has(staffId)) workedDays.set(staffId, new Set()); workedDays.get(staffId)!.add(slot.day); counts.set(staffId, (counts.get(staffId) ?? 0) + 1); const mix = shiftCounts.get(staffId) ?? { early: 0, late: 0 }; if (slot.shift === "early") mix.early += 1; if (slot.shift === "late") mix.late += 1; shiftCounts.set(staffId, mix); lastShift.set(staffId, { day: slot.day, shift: slot.shift }); };
+  const rebuildStats = () => { usedByDay.clear(); workedDays.clear(); counts.clear(); shiftCounts.clear(); lastShift.clear(); assignments.filter((slot) => slot.staffId).sort((a, b) => a.day - b.day || minutes(a.start) - minutes(b.start)).forEach((slot) => record(slot, slot.staffId!)); };
+  const requestedDays = (person: Staff) => (period.availability[person.id] ?? []).filter((value, day) => value === "all" || value === "early" || value === "late" || (value === "custom" && (period.customTimes[person.id]?.[day]?.length ?? 0) > 0)).length;
+  const isStefan = (person: Staff) => person.id === "shuanglin" || person.name.trim().toLowerCase() === "stefan" || person.name.trim() === "双林";
+  const isNemo = (person: Staff) => person.id === "nemo" || person.name.trim().toLowerCase() === "nemo";
+  const conflictsWithGroup = (person: Staff, grouped: Assignment[]) => grouped.some((other) => { const colleague = staff.find((candidate) => candidate.id === other.staffId); return colleague && ((isStefan(person) && isNemo(colleague)) || (isNemo(person) && isStefan(colleague))); });
   assignments.filter((slot) => slot.locked && slot.staffId).forEach((slot) => record(slot, slot.staffId!));
   const choose = (slot: Assignment) => {
     const grouped = assignments.filter((other) => slotGroup(other) === slotGroup(slot) && other.staffId);
     const hasBB = grouped.some((other) => staff.find((person) => person.id === other.staffId)?.role === "BB");
     const fullTimeLeader = grouped.some((other) => { const person = staff.find((candidate) => candidate.id === other.staffId); return person?.role === "SS" && person.employment === "全职"; });
-    const rank = (roles: Role[]) => active.filter((person) => roles.includes(person.role)).filter((person) => !(usedByDay.get(slot.day)?.has(person.id))).filter((person) => !(person.role === "BB" && hasBB)).filter((person) => availabilityMatch(period, person.id, slot.day, slot.shift, slot.start, slot.end)).filter((person) => { const proposed = new Set(workedDays.get(person.id) ?? []); proposed.add(slot.day); return maxConsecutive(proposed, dates.length) <= 6; }).map((person) => { let score = 0; const total = counts.get(person.id) ?? 0; const mix = shiftCounts.get(person.id) ?? { early: 0, late: 0 }; if (person.store === slot.store) score += 30; if (person.employment === "兼职") score += Math.max(12, 46 - total * 7); else score += total < Math.ceil(dates.length * 5 / 7) ? 18 : -20; if (person.preference === "early") score += slot.shift === "early" ? 8 : slot.shift === "late" ? -6 : 0; if (slot.shift === "early") score += (mix.late - mix.early) * 22; if (slot.shift === "late") score += (mix.early - mix.late) * 22; const prior = lastShift.get(person.id); if (prior?.day === slot.day - 1 && prior.shift === "late" && slot.shift === "early") score -= 120; if (person.id === "jennifer" && person.store !== slot.store) score += 6; if (person.novice && !person.mature) score += fullTimeLeader ? 16 : -10; score -= total; return { person, score }; }).sort((a, b) => b.score - a.score || a.person.name.localeCompare(b.person.name))[0]?.person;
+    const rank = (roles: Role[]) => active.filter((person) => roles.includes(person.role)).filter((person) => !(usedByDay.get(slot.day)?.has(person.id))).filter((person) => !(person.role === "BB" && hasBB)).filter((person) => availabilityMatch(period, person.id, slot.day, slot.shift, slot.start, slot.end)).filter((person) => { const proposed = new Set(workedDays.get(person.id) ?? []); proposed.add(slot.day); return maxConsecutive(proposed, dates.length) <= 6; }).map((person) => {
+      const total = counts.get(person.id) ?? 0;
+      const desired = Math.max(1, requestedDays(person));
+      const mix = shiftCounts.get(person.id) ?? { early: 0, late: 0 };
+      const projectedEarly = mix.early + (slot.shift === "early" ? 1 : 0);
+      const projectedLate = mix.late + (slot.shift === "late" ? 1 : 0);
+      const prior = lastShift.get(person.id);
+      return {
+        person,
+        // This is a real priority tier, not one more additive score: an
+        // under-filled part timer always ranks ahead of a full timer.
+        workTier: person.employment === "兼职" && total < desired ? 0 : person.employment === "全职" && total < fullTimeTarget ? 1 : 2,
+        fulfillment: person.employment === "兼职" ? total / desired : total,
+        lateToEarly: prior?.day === slot.day - 1 && prior.shift === "late" && slot.shift === "early" ? 1 : 0,
+        pairingConflict: conflictsWithGroup(person, grouped) ? 1 : 0,
+        imbalance: Math.abs(projectedEarly - projectedLate),
+        noviceWithoutFullTimeLeader: person.novice && !person.mature && !fullTimeLeader ? 1 : 0,
+        preferenceMiss: person.preference === "early" && slot.shift === "late" ? 1 : 0,
+        crossStore: person.store === slot.store || person.id === "jennifer" ? 0 : 1,
+        total,
+      };
+    }).sort((a, b) => a.workTier - b.workTier
+      || a.fulfillment - b.fulfillment
+      || a.lateToEarly - b.lateToEarly
+      || a.pairingConflict - b.pairingConflict
+      || a.imbalance - b.imbalance
+      || a.noviceWithoutFullTimeLeader - b.noviceWithoutFullTimeLeader
+      || a.preferenceMiss - b.preferenceMiss
+      || a.crossStore - b.crossStore
+      || a.total - b.total
+      || a.person.name.localeCompare(b.person.name))[0]?.person;
     const preferredRoles: Role[] = slot.role === "ANY" ? ["SS", "BB"] : [slot.role];
     const preferred = rank(preferredRoles);
     if (preferred) return preferred;
@@ -148,6 +184,37 @@ export function generateSchedule(staff: Staff[], period: PeriodState) {
   };
   const openSlots = assignments.filter((slot) => !slot.locked).sort((a, b) => a.day - b.day || (a.role === "SS" ? -1 : a.role === "BB" ? 1 : 0));
   for (const slot of openSlots) { const selected = choose(slot); if (selected) { slot.staffId = selected.id; const match = availabilityMatch(period, selected.id, slot.day, slot.shift, slot.start, slot.end); if (match?.adjusted && match.window) { slot.start = match.window.start; slot.end = match.window.end; slot.customTime = true; } record(slot, selected.id); } }
+  // Full-period audit: if an unlocked full-time assignment can be handed to
+  // an under-filled, same-role part timer without breaking a hard rule, do it.
+  // This catches any locally-greedy choice that survived the first pass.
+  let changed = true;
+  while (changed) {
+    changed = false;
+    rebuildStats();
+    const fullTimeSlots = assignments.filter((slot) => !slot.locked && !slot.middleId && slot.staffId && staff.find((person) => person.id === slot.staffId)?.employment === "全职");
+    for (const slot of fullTimeSlots) {
+      const current = staff.find((person) => person.id === slot.staffId);
+      if (!current) continue;
+      const [baseStart, baseEnd] = shiftTimes[slot.store][slot.shift as "early" | "late"];
+      const candidates = active.filter((person) => person.employment === "兼职" && person.role === current.role)
+        .filter((person) => (counts.get(person.id) ?? 0) < requestedDays(person))
+        .filter((person) => !(usedByDay.get(slot.day)?.has(person.id)))
+        .filter((person) => availabilityMatch(period, person.id, slot.day, slot.shift, baseStart, baseEnd))
+        .filter((person) => { const proposed = new Set(workedDays.get(person.id) ?? []); proposed.add(slot.day); return maxConsecutive(proposed, dates.length) <= 6; })
+        .sort((a, b) => ((counts.get(a.id) ?? 0) / Math.max(1, requestedDays(a))) - ((counts.get(b.id) ?? 0) / Math.max(1, requestedDays(b))) || a.name.localeCompare(b.name));
+      const replacement = candidates[0];
+      if (!replacement) continue;
+      slot.staffId = replacement.id;
+      slot.start = baseStart;
+      slot.end = baseEnd;
+      slot.customTime = false;
+      const match = availabilityMatch(period, replacement.id, slot.day, slot.shift, baseStart, baseEnd);
+      if (match?.adjusted && match.window) { slot.start = match.window.start; slot.end = match.window.end; slot.customTime = true; }
+      changed = true;
+      break;
+    }
+  }
+  rebuildStats();
   const bridgeDetails = new Map<string, string>();
   for (let day = 0; day < dates.length; day += 1) for (const store of stores) for (const role of ["SS", "BB"] as const) {
     const early = assignments.find((slot) => slot.day === day && slot.store === store && slot.shift === "early" && slot.role === role);
@@ -187,6 +254,8 @@ export function generateSchedule(staff: Staff[], period: PeriodState) {
     if (slots.length !== 2 || slots.some((slot) => !slot.staffId)) return;
     const roles = slots.map((slot) => staff.find((person) => person.id === slot.staffId)?.role);
     if (roles.every((role) => role === "SS")) warnings.push(`【提醒】${dateLabel(dates[slots[0].day])}｜${slots[0].store}｜${shiftLabel(slots[0].shift)}：暂无可用BB，已由2名SS覆盖。`);
+    const people = slots.flatMap((slot) => { const person = staff.find((candidate) => candidate.id === slot.staffId); return person ? [person] : []; });
+    if (people.some(isStefan) && people.some(isNemo)) warnings.push(`【提醒】${dateLabel(dates[slots[0].day])}｜${slots[0].store}｜${shiftLabel(slots[0].shift)}：Stefan（双林）与nemo因班次覆盖需要同班。`);
   });
   assignments.filter((slot) => slot.staffId && slot.customTime).forEach((slot) => {
     const person = staff.find((candidate) => candidate.id === slot.staffId);
@@ -194,7 +263,7 @@ export function generateSchedule(staff: Staff[], period: PeriodState) {
     warnings.push(`【注意】${person?.name ?? "员工"} ${dateLabel(dates[slot.day])}可上${slot.start}–${slot.end}，已安排${slot.store.replace("店", "")}${shiftLabel(slot.shift)}；与标准时间不完全一致，${bridge ? `${bridge}，` : ""}请协商上下班时间。`);
   });
   assignments.filter((slot) => slot.staffId).forEach((slot) => { const person = staff.find((candidate) => candidate.id === slot.staffId); if (!person?.novice || person.mature) return; const leader = assignments.find((other) => slotGroup(other) === slotGroup(slot) && other.staffId && staff.find((candidate) => candidate.id === other.staffId)?.role === "SS"); const leaderPerson = staff.find((candidate) => candidate.id === leader?.staffId); if (leaderPerson && leaderPerson.employment !== "全职") warnings.push(`【注意】${dateLabel(dates[slot.day])}｜${slot.store}｜${shiftLabel(slot.shift)}：新员工${person.name}由兼职SS ${leaderPerson.name}带班。`); });
-  active.filter((person) => person.employment === "全职").forEach((person) => { const total = counts.get(person.id) ?? 0; const target = Math.min(dates.length, Math.ceil(dates.length * 5 / 7)); if (total < target) warnings.push(`${total <= Math.max(0, target - 3) ? "【注意】" : "【提醒】"}${person.name} 本周期安排 ${total} 天，低于全职 ${target} 天参考目标。`); if (total > target) warnings.push(`【提醒】${person.name} 本周期安排 ${total} 天，请留意工作量和连续工作天数。`); });
+  active.filter((person) => person.employment === "全职").forEach((person) => { const total = counts.get(person.id) ?? 0; if (total < fullTimeTarget) warnings.push(`${total <= Math.max(0, fullTimeTarget - 2) ? "【注意】" : "【提醒】"}${person.name} 本周期安排 ${total} 天，低于全职 ${fullTimeTarget} 天参考目标。`); if (total > fullTimeTarget) warnings.push(`【注意】${person.name} 本周期安排 ${total} 天，已超过全职 ${fullTimeTarget} 天参考目标；当前没有可直接替换的同角色兼职，请确认工作量和连续工作天数。`); });
   active.forEach((person) => { const mix = shiftCounts.get(person.id) ?? { early: 0, late: 0 }; if (mix.early + mix.late >= 2 && Math.abs(mix.early - mix.late) >= 2) warnings.push(`【提醒】${person.name} 本周期白班${mix.early}次、晚班${mix.late}次，因覆盖或班次衔接未能完全均分。`); });
   assignments.filter((slot) => slot.staffId && slot.shift === "early").forEach((slot) => { if (assignments.some((other) => other.staffId === slot.staffId && other.day === slot.day - 1 && other.shift === "late")) warnings.push(`【注意】${staff.find((person) => person.id === slot.staffId)?.name}存在晚班接次日白班（${dateLabel(dates[slot.day])}）。`); });
   return { assignments, warnings };
