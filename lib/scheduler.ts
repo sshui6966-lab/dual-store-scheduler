@@ -159,6 +159,7 @@ export function generateSchedule(staff: Staff[], period: PeriodState) {
         // under-filled part timer always ranks ahead of a full timer.
         workTier: person.employment === "兼职" && total < desired ? 0 : person.employment === "全职" && total < fullTimeTarget ? 1 : 2,
         fulfillment: person.employment === "兼职" ? total / desired : total,
+        scarcity: person.employment === "兼职" ? desired : dates.length + 1,
         lateToEarly: prior?.day === slot.day - 1 && prior.shift === "late" && slot.shift === "early" ? 1 : 0,
         pairingConflict: conflictsWithGroup(person, grouped) ? 1 : 0,
         imbalance: Math.abs(projectedEarly - projectedLate),
@@ -169,6 +170,7 @@ export function generateSchedule(staff: Staff[], period: PeriodState) {
       };
     }).sort((a, b) => a.workTier - b.workTier
       || a.fulfillment - b.fulfillment
+      || a.scarcity - b.scarcity
       || a.lateToEarly - b.lateToEarly
       || a.pairingConflict - b.pairingConflict
       || a.imbalance - b.imbalance
