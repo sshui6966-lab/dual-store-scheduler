@@ -1,13 +1,14 @@
 "use client";
 
-import { useEffect, useRef, useState } from "react";
-import { AlertTriangle, CalendarDays, Check, ChevronLeft, ChevronRight, ClipboardCheck, Clock3, Copy, Download, FileSpreadsheet, History, ImageDown, LayoutGrid, ListChecks, Lock, MoreHorizontal, Plus, RotateCcw, Settings2, Sparkles, Store as StoreIcon, UserPlus, UsersRound } from "lucide-react";
+import { type ChangeEvent, useEffect, useRef, useState } from "react";
+import { AlertTriangle, CalendarDays, Check, ChevronLeft, ChevronRight, ClipboardCheck, Clock3, Copy, Download, FileSpreadsheet, History, ImageDown, LayoutGrid, ListChecks, Lock, LogIn, LogOut, MoreHorizontal, Plus, RotateCcw, Settings2, Sparkles, Store as StoreIcon, Upload, UserPlus, UsersRound } from "lucide-react";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { Dialog, DialogContent, DialogDescription, DialogHeader, DialogTitle } from "@/components/ui/dialog";
 import { Switch } from "@/components/ui/switch";
+import { cloud, cloudConfigured } from "@/lib/cloud";
 import {
   type AppState, type Assignment, type Availability, type MiddleShift, type Participation, type PeriodState, type Role, type Staff, type Store, type TimeWindow,
-  dateLabel, dateList, emptyPeriod, generateSchedule, hoursFor, initialState, isoDate, migrateState, parseDate, shiftLabel, shiftTimes, shortDate, stores,
+  dateLabel, dateList, emptyPeriod, generateSchedule, hoursFor, initialState, isoDate, migrateState, parseDate, publicScheduleState, shiftLabel, shiftTimes, shortDate, stores,
 } from "@/lib/scheduler";
 
 const availabilityOptions: Array<{ value: Availability; label: string; short: string }> = [
@@ -20,6 +21,7 @@ const availabilityOptions: Array<{ value: Availability; label: string; short: st
 ];
 const participationLabel: Record<Participation, string> = { unconfirmed: "未确认", confirmed: "已确认", excluded: "本期不参与" };
 const statusLabel = Object.fromEntries(availabilityOptions.map((item) => [item.value, item.short])) as Record<Availability, string>;
+const STORAGE_KEY = "dual-store-scheduler-state-v1";
 
 function todayRange() {
   const start = new Date(); start.setHours(0, 0, 0, 0);
@@ -33,7 +35,11 @@ export function SchedulerApp() {
   const [state, setState] = useState<AppState>(initialState);
   const [periodKey, setPeriodKey] = useState("");
   const [loaded, setLoaded] = useState(false);
-  const [saveStatus, setSaveStatus] = useState("正在连接…");
+  const [saveStatus, setSaveStatus] = useState("正在读取本机数据…");
+  const [isManager, setIsManager] = useState(!cloudConfigured);
+  const [loginOpen, setLoginOpen] = useState(false);
+  const [loginDraft, setLoginDraft] = useState({ email: "", password: "" });
+  const [loginStatus, setLoginStatus] = useState("");
   const [tab, setTab] = useState("home");
   const [dayIndex, setDayIndex] = useState(0);
   const [scheduleView, setScheduleView] = useState<"daily" | "week" | "period">("daily");
@@ -52,6 +58,7 @@ export function SchedulerApp() {
   const [activityOpen, setActivityOpen] = useState(false);
   const [canUndo, setCanUndo] = useState(false);
   const saveTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const importInput = useRef<HTMLInputElement | null>(null);
   const undoStack = useRef<PeriodState[]>([]);
 
   const period = state.periods[periodKey];
@@ -64,38 +71,81 @@ export function SchedulerApp() {
   const softWarnings = period?.warnings.filter((warning) => !warning.startsWith("【硬】")) ?? [];
 
   useEffect(() => {
-    let alive = true;
-    fetch("/api/state").then(async (response) => {
-      if (!response.ok) throw new Error("unavailable");
-      return response.json() as Promise<{ state: unknown; updatedAt: string | null }>;
-    }).then((data) => {
-      if (!alive) return;
-      const next = migrateState(data.state);
-      if (!Object.keys(next.periods).length) {
-        const initialRange = todayRange();
-        const created = emptyPeriod(next.staff, initialRange.startDate, initialRange.endDate);
-        next.periods[created.id] = created;
+    let cancelled = false;
+    queueMicrotask(async () => {
+      if (cancelled) return;
+      try {
+        if (cloud) {
+          const { data: sessionData } = await cloud.auth.getSession();
+          const signedIn = Boolean(sessionData.session);
+          let manager = false;
+          if (signedIn) {
+            const { data } = await cloud.rpc("is_scheduler_manager");
+            manager = data === true;
+          }
+          const { data: row, error } = await cloud.from("app_state").select("payload").eq("id", manager ? "manager" : "public").maybeSingle();
+          if (error) throw error;
+          if (cancelled) return;
+          setIsManager(manager);
+          if (row?.payload) {
+            const next = migrateState(row.payload);
+            const selected = Object.entries(next.periods).sort((a, b) => b[1].startDate.localeCompare(a[1].startDate))[0]?.[0] ?? "";
+            setState(next); setPeriodKey(selected); setSaveStatus(manager ? "已从云端同步" : "公开班表 · 云端同步");
+          } else if (manager) {
+            const saved = window.localStorage.getItem(STORAGE_KEY);
+            const next = migrateState(saved ? JSON.parse(saved) : null);
+            if (!Object.keys(next.periods).length) {
+              const initialRange = todayRange(); const created = emptyPeriod(next.staff, initialRange.startDate, initialRange.endDate); next.periods[created.id] = created;
+            }
+            const selected = Object.entries(next.periods).sort((a, b) => b[1].startDate.localeCompare(a[1].startDate))[0][0];
+            setState(next); setPeriodKey(selected); setSaveStatus("店长模式 · 准备云端首次保存");
+          } else {
+            setState(initialState()); setPeriodKey(""); setSaveStatus("暂无已发布班表");
+          }
+          return;
+        }
+        const saved = window.localStorage.getItem(STORAGE_KEY);
+        const next = migrateState(saved ? JSON.parse(saved) : null);
+        if (!Object.keys(next.periods).length) {
+          const initialRange = todayRange();
+          const created = emptyPeriod(next.staff, initialRange.startDate, initialRange.endDate);
+          next.periods[created.id] = created;
+        }
+        const selected = Object.entries(next.periods).sort((a, b) => b[1].startDate.localeCompare(a[1].startDate))[0][0];
+        setState(next); setPeriodKey(selected); setSaveStatus(saved ? "已从本机载入" : "已创建新周期");
+      } catch {
+        const next = initialState(); const initialRange = todayRange(); const created = emptyPeriod(next.staff, initialRange.startDate, initialRange.endDate); next.periods[created.id] = created;
+        setState(next); setPeriodKey(created.id); setSaveStatus("本机数据异常，已新建");
+      } finally {
+        setLoaded(true);
       }
-      const selected = Object.entries(next.periods).sort((a, b) => b[1].startDate.localeCompare(a[1].startDate))[0][0];
-      setState(next); setPeriodKey(selected); setSaveStatus(data.state ? "已同步" : "已创建新周期");
-    }).catch(() => {
-      const next = initialState(); const initialRange = todayRange(); const created = emptyPeriod(next.staff, initialRange.startDate, initialRange.endDate); next.periods[created.id] = created;
-      if (alive) { setState(next); setPeriodKey(created.id); setSaveStatus("暂未连接云端"); }
-    }).finally(() => alive && setLoaded(true));
-    return () => { alive = false; };
+    });
+    return () => { cancelled = true; };
   }, []);
 
   useEffect(() => {
-    if (!loaded || !periodKey) return;
+    if (!loaded || !periodKey || !isManager) return;
     if (saveTimer.current) clearTimeout(saveTimer.current);
-    saveTimer.current = setTimeout(() => {
-      setSaveStatus("保存中…");
-      fetch("/api/state", { method: "PUT", headers: { "content-type": "application/json" }, body: JSON.stringify(state) })
-        .then((response) => { if (!response.ok) throw new Error("save failed"); setSaveStatus(`已保存 ${new Date().toLocaleTimeString("zh-CN", { hour: "2-digit", minute: "2-digit" })}`); })
-        .catch(() => setSaveStatus("保存失败，点击重试"));
+    saveTimer.current = setTimeout(async () => {
+      try {
+        window.localStorage.setItem(STORAGE_KEY, JSON.stringify(state));
+        if (cloud) {
+          const updatedAt = new Date().toISOString();
+          const { error } = await cloud.from("app_state").upsert([
+            { id: "manager", payload: state, updated_at: updatedAt },
+            { id: "public", payload: publicScheduleState(state), updated_at: updatedAt },
+          ]);
+          if (error) throw error;
+          setSaveStatus(`已同步云端 ${new Date().toLocaleTimeString("zh-CN", { hour: "2-digit", minute: "2-digit" })}`);
+        } else {
+          setSaveStatus(`已保存到本机 ${new Date().toLocaleTimeString("zh-CN", { hour: "2-digit", minute: "2-digit" })}`);
+        }
+      } catch {
+        setSaveStatus("云端同步失败，已保留本机备份");
+      }
     }, 500);
     return () => { if (saveTimer.current) clearTimeout(saveTimer.current); };
-  }, [state, loaded, periodKey]);
+  }, [state, loaded, periodKey, isManager]);
 
   const updatePeriod = (label: string, updater: (current: PeriodState) => PeriodState, keepPublished = false) => {
     if (!periodKey) return;
@@ -180,6 +230,43 @@ export function SchedulerApp() {
   };
   const updateStaff = (person: Staff) => { setState((current) => ({ ...current, staff: current.staff.map((item) => item.id === person.id ? person : item) })); setEditingStaff(null); };
 
+  const enterManagerMode = async () => {
+    if (!cloud) return;
+    const { data: owned, error: claimError } = await cloud.rpc("claim_scheduler_manager");
+    if (claimError || owned !== true) throw new Error("该云端班表已绑定其他店长账号。");
+    const { data: row, error } = await cloud.from("app_state").select("payload").eq("id", "manager").maybeSingle();
+    if (error) throw error;
+    const next = row?.payload ? migrateState(row.payload) : migrateState(JSON.parse(window.localStorage.getItem(STORAGE_KEY) ?? "null"));
+    if (!Object.keys(next.periods).length) {
+      const initialRange = todayRange(); const created = emptyPeriod(next.staff, initialRange.startDate, initialRange.endDate); next.periods[created.id] = created;
+    }
+    const selected = Object.entries(next.periods).sort((a, b) => b[1].startDate.localeCompare(a[1].startDate))[0][0];
+    setState(next); setPeriodKey(selected); setIsManager(true); setTab("home"); setLoginOpen(false); setLoginStatus(""); setSaveStatus("店长模式 · 已连接云端");
+  };
+  const signInManager = async () => {
+    if (!cloud || !loginDraft.email || !loginDraft.password) return;
+    setLoginStatus("正在登录…");
+    const { error } = await cloud.auth.signInWithPassword(loginDraft);
+    if (error) { setLoginStatus("邮箱或密码不正确。"); return; }
+    try { await enterManagerMode(); } catch (error) { setLoginStatus(error instanceof Error ? error.message : "无法进入店长模式。"); }
+  };
+  const createManager = async () => {
+    if (!cloud || !loginDraft.email || loginDraft.password.length < 8) { setLoginStatus("请填写邮箱，密码至少8位。"); return; }
+    setLoginStatus("正在创建店长账号…");
+    const { data, error } = await cloud.auth.signUp(loginDraft);
+    if (error) { setLoginStatus(error.message); return; }
+    if (!data.session) { setLoginStatus("验证邮件已发送，验证后返回登录。"); return; }
+    try { await enterManagerMode(); } catch (error) { setLoginStatus(error instanceof Error ? error.message : "无法创建店长账号。"); }
+  };
+  const signOutManager = async () => {
+    if (!cloud) return;
+    await cloud.auth.signOut();
+    const { data: row } = await cloud.from("app_state").select("payload").eq("id", "public").maybeSingle();
+    const next = migrateState(row?.payload ?? null);
+    const selected = Object.entries(next.periods).sort((a, b) => b[1].startDate.localeCompare(a[1].startDate))[0]?.[0] ?? "";
+    setState(next); setPeriodKey(selected); setIsManager(false); setTab("schedule"); setSaveStatus(row?.payload ? "公开班表 · 云端同步" : "暂无已发布班表");
+  };
+
   const exportExcel = () => {
     if (!period) return;
     const header = ["员工", "身份", ...dates.map(dateLabel), "本周期工时"];
@@ -188,6 +275,26 @@ export function SchedulerApp() {
     }), (staffHours.get(person.id) ?? 0).toFixed(2)]);
     const html = `<html><head><meta charset="UTF-8"></head><body><table border="1"><tr>${header.map((cell) => `<th>${cell}</th>`).join("")}</tr>${rows.map((row) => `<tr>${row.map((cell) => `<td>${cell}</td>`).join("")}</tr>`).join("")}</table></body></html>`;
     downloadBlob(new Blob([html], { type: "application/vnd.ms-excel;charset=utf-8" }), `${safeFilename(period.title)}-班表.xls`);
+  };
+  const exportBackup = () => {
+    const payload = JSON.stringify({ format: "dual-store-scheduler", version: 1, exportedAt: new Date().toISOString(), state }, null, 2);
+    downloadBlob(new Blob([payload], { type: "application/json;charset=utf-8" }), `双店排班备份-${isoDate(new Date())}.json`);
+    setMoreOpen(false);
+  };
+  const importBackup = async (event: ChangeEvent<HTMLInputElement>) => {
+    const file = event.target.files?.[0];
+    event.target.value = "";
+    if (!file) return;
+    try {
+      const parsed = JSON.parse(await file.text()) as { format?: string; state?: unknown };
+      const next = migrateState(parsed?.format === "dual-store-scheduler" ? parsed.state : parsed);
+      if (!Object.keys(next.periods).length) throw new Error("empty backup");
+      const selected = Object.entries(next.periods).sort((a, b) => b[1].startDate.localeCompare(a[1].startDate))[0][0];
+      window.localStorage.setItem(STORAGE_KEY, JSON.stringify(next));
+      setState(next); setPeriodKey(selected); setDayIndex(0); setMoreOpen(false); setSaveStatus("备份已恢复并保存到本机");
+    } catch {
+      setSaveStatus("备份无法读取，请选择本系统导出的 JSON 文件");
+    }
   };
   const exportImage = () => {
     if (!period) return;
@@ -229,12 +336,25 @@ export function SchedulerApp() {
     return () => lifecycle.abort();
   }, [period, confirmed, activeStaff.length]);
 
+  if (!loaded) return <main className="loading-screen">正在连接云端班表…</main>;
+  if (!period && !isManager) return <main className="public-empty"><div className="poster-strip" aria-hidden="true"><span /><span /><span /><span /><span /></div><section><CalendarDays /><h1>暂无已发布班表</h1><p>店长发布班表后，所有人在这里看到的都是同一份最新内容。</p><button onClick={() => setLoginOpen(true)}><LogIn />店长登录</button></section><ManagerLoginDialog open={loginOpen} onOpen={setLoginOpen} draft={loginDraft} setDraft={setLoginDraft} status={loginStatus} onSignIn={signInManager} onCreate={createManager} /></main>;
   if (!period) return <main className="loading-screen">正在准备排班工作台…</main>;
+
+  if (!isManager) return (
+    <main className="app-shell public-mode">
+      <div className="poster-strip" aria-hidden="true"><span /><span /><span /><span /><span /></div>
+      <header className="topbar"><div><p className="eyebrow">DUAL STORE / PUBLISHED SCHEDULE</p><h1>双店班表</h1></div><button className="session-button" onClick={() => setLoginOpen(true)}><LogIn />店长登录</button></header>
+      <div className="period-switcher"><button onClick={() => setPeriodKey(previousPeriodKey(state, periodKey, -1) ?? periodKey)} aria-label="上一个周期"><ChevronLeft /></button><div className="period-title"><b>{period.title}</b><small>{shortDate(period.startDate)}—{shortDate(period.endDate)} · {dates.length}天</small></div><button onClick={() => setPeriodKey(previousPeriodKey(state, periodKey, 1) ?? periodKey)} aria-label="下一个周期"><ChevronRight /></button></div>
+      <div className="save-line"><span>{saveStatus}</span><span>{period.status === "published" ? `已发布 V${period.version}` : "有临时调整"}</span></div>
+      <div className="page-frame public-schedule"><SchedulePanel period={period} dates={dates} staff={state.staff} dayIndex={dayIndex} onDay={setDayIndex} view={scheduleView} onView={setScheduleView} onSlot={() => undefined} onRun={() => undefined} onUndo={() => undefined} canUndo={false} onPublish={() => undefined} hardWarnings={[]} onExportImage={exportImage} onExportExcel={exportExcel} readOnly /></div>
+      <ManagerLoginDialog open={loginOpen} onOpen={setLoginOpen} draft={loginDraft} setDraft={setLoginDraft} status={loginStatus} onSignIn={signInManager} onCreate={createManager} />
+    </main>
+  );
 
   return (
     <main className="app-shell">
       <div className="poster-strip" aria-hidden="true"><span /><span /><span /><span /><span /></div>
-      <header className="topbar"><div><p className="eyebrow">DUAL STORE / MANAGER DESK</p><h1>双店排班助手</h1></div><button className="more-button" onClick={() => setMoreOpen(true)} aria-label="更多"><MoreHorizontal /></button></header>
+      <header className="topbar"><div><p className="eyebrow">DUAL STORE / MANAGER DESK</p><h1>双店排班助手</h1></div><div className="topbar-actions">{cloudConfigured && <button className="session-button" onClick={signOutManager}><LogOut />退出</button>}<button className="more-button" onClick={() => setMoreOpen(true)} aria-label="更多"><MoreHorizontal /></button></div></header>
       <div className="period-switcher"><button onClick={() => setPeriodKey(previousPeriodKey(state, periodKey, -1) ?? periodKey)} aria-label="上一个周期"><ChevronLeft /></button><button className="period-title" onClick={() => setMoreOpen(true)}><b>{period.title}</b><small>{shortDate(period.startDate)}—{shortDate(period.endDate)} · {dates.length}天</small></button><button onClick={() => setPeriodKey(previousPeriodKey(state, periodKey, 1) ?? periodKey)} aria-label="下一个周期"><ChevronRight /></button></div>
       <div className="save-line"><span className={saveStatus.includes("失败") ? "error" : ""}>{saveStatus}</span><span>{period.status === "published" ? `已发布 V${period.version}` : period.status === "adjusted" ? "有临时调整" : "草稿"}</span></div>
 
@@ -250,13 +370,15 @@ export function SchedulerApp() {
       </Tabs>
 
       <Dialog open={periodOpen} onOpenChange={setPeriodOpen}><DialogContent className="editor-dialog"><PeriodEditor draft={periodDraft} setDraft={setPeriodDraft} editing={periodEditing} onSave={savePeriod} /></DialogContent></Dialog>
-      <Dialog open={moreOpen} onOpenChange={setMoreOpen}><DialogContent className="editor-dialog"><DialogHeader><DialogTitle>周期与工具</DialogTitle><DialogDescription>管理日期、历史记录和导出。</DialogDescription></DialogHeader><div className="menu-grid"><button onClick={() => { setMoreOpen(false); openNewPeriod(); }}><Plus />新建周期</button><button onClick={copyPeriodSettings}><Copy />复制周期设置</button><button onClick={() => { setMoreOpen(false); openEditPeriod(); }}><Settings2 />编辑当前周期</button><button onClick={() => { setMoreOpen(false); setActivityOpen(true); }}><History />操作记录</button><button onClick={exportImage}><ImageDown />生成长图</button><button onClick={exportExcel}><FileSpreadsheet />导出Excel</button><button onClick={undo} disabled={!canUndo}><RotateCcw />撤销上一项</button></div><div className="period-list"><b>历史周期</b>{Object.entries(state.periods).sort((a, b) => b[1].startDate.localeCompare(a[1].startDate)).map(([key, item]) => <button key={key} className={key === periodKey ? "active" : ""} onClick={() => { setPeriodKey(key); setMoreOpen(false); setDayIndex(0); }}><span>{item.title}<small>{shortDate(item.startDate)}—{shortDate(item.endDate)}</small></span><i>{item.status === "published" ? `V${item.version}` : "草稿"}</i></button>)}</div></DialogContent></Dialog>
+      <input ref={importInput} type="file" accept="application/json,.json" hidden onChange={importBackup} />
+      <Dialog open={moreOpen} onOpenChange={setMoreOpen}><DialogContent className="editor-dialog"><DialogHeader><DialogTitle>周期与工具</DialogTitle><DialogDescription>数据自动保存在当前设备，建议定期导出备份。</DialogDescription></DialogHeader><div className="menu-grid"><button onClick={() => { setMoreOpen(false); openNewPeriod(); }}><Plus />新建周期</button><button onClick={copyPeriodSettings}><Copy />复制周期设置</button><button onClick={() => { setMoreOpen(false); openEditPeriod(); }}><Settings2 />编辑当前周期</button><button onClick={() => { setMoreOpen(false); setActivityOpen(true); }}><History />操作记录</button><button onClick={exportImage}><ImageDown />生成长图</button><button onClick={exportExcel}><FileSpreadsheet />导出Excel</button><button onClick={exportBackup}><Download />备份全部数据</button><button onClick={() => importInput.current?.click()}><Upload />恢复备份</button><button onClick={undo} disabled={!canUndo}><RotateCcw />撤销上一项</button></div><div className="period-list"><b>历史周期</b>{Object.entries(state.periods).sort((a, b) => b[1].startDate.localeCompare(a[1].startDate)).map(([key, item]) => <button key={key} className={key === periodKey ? "active" : ""} onClick={() => { setPeriodKey(key); setMoreOpen(false); setDayIndex(0); }}><span>{item.title}<small>{shortDate(item.startDate)}—{shortDate(item.endDate)}</small></span><i>{item.status === "published" ? `V${item.version}` : "草稿"}</i></button>)}</div></DialogContent></Dialog>
       <Dialog open={activityOpen} onOpenChange={setActivityOpen}><DialogContent className="editor-dialog"><DialogHeader><DialogTitle>操作记录</DialogTitle><DialogDescription>最近200项修改都会保留。</DialogDescription></DialogHeader><div className="activity-list">{period.activities.length ? period.activities.map((item) => <div key={item.id}><b>{item.label}</b><small>{new Date(item.at).toLocaleString("zh-CN")}</small></div>) : <p className="empty-copy">还没有操作记录。</p>}</div></DialogContent></Dialog>
       <Dialog open={!!availabilityEditor} onOpenChange={(open) => !open && setAvailabilityEditor(null)}><DialogContent className="editor-dialog">{availabilityEditor && <AvailabilityEditor staff={state.staff.find((person) => person.id === availabilityEditor.staffId)!} date={dates[availabilityEditor.day]} value={period.availability[availabilityEditor.staffId]?.[availabilityEditor.day] ?? "unconfirmed"} custom={customDraft} setCustom={setCustomDraft} onSelect={(value) => { if (value === "custom") return; setAvailability(availabilityEditor.staffId, availabilityEditor.day, value); setAvailabilityEditor(null); }} onSaveCustom={saveCustomTime} />}</DialogContent></Dialog>
       <Dialog open={middleOpen} onOpenChange={setMiddleOpen}><DialogContent className="editor-dialog"><MiddleEditor draft={middleDraft} setDraft={setMiddleDraft} dates={dates} onSave={addMiddle} /></DialogContent></Dialog>
       <Dialog open={!!editingSlot} onOpenChange={(open) => !open && setEditingSlotId(null)}><DialogContent className="editor-dialog">{editingSlot && <SlotEditor slot={editingSlot} date={dates[editingSlot.day]} candidates={candidateStaff} onSave={updateSlot} />}</DialogContent></Dialog>
       <Dialog open={!!editingStaff} onOpenChange={(open) => !open && setEditingStaff(null)}><DialogContent className="editor-dialog">{editingStaff && <StaffEditor person={editingStaff} onSave={updateStaff} />}</DialogContent></Dialog>
       <Dialog open={addingStaff} onOpenChange={setAddingStaff}><DialogContent className="editor-dialog"><StaffEditor person={{ id: "new-staff", name: "", store: "星光店", role: "BB", employment: "兼职", active: true }} adding onSave={addStaff} /></DialogContent></Dialog>
+      <ManagerLoginDialog open={loginOpen} onOpen={setLoginOpen} draft={loginDraft} setDraft={setLoginDraft} status={loginStatus} onSignIn={signInManager} onCreate={createManager} />
     </main>
   );
 }
@@ -277,12 +399,12 @@ function DemandPanel({ period, dates, dayIndex, onDay, onAdd, onDelete }: { peri
   return <><div className="section-heading"><div><p className="section-kicker">02 / SHIFT NEEDS</p><h2>班次需求</h2><p>基础班固定两人，中班可以增加1—2人。</p></div><button className="small-action accent" onClick={onAdd}><Plus />加中班</button></div><DateStrip dates={dates} active={dayIndex} onChange={onDay} /><div className="store-stack">{stores.map((store, storeIndex) => <article className={`store-card store-${storeIndex}`} key={store}><div className="store-head"><div><StoreIcon /><b>{store}</b></div><span>基础4人</span></div><div className="demand-body">{(["early", "late"] as const).map((shift) => <div className="base-demand" key={shift}><span><b>{shiftLabel(shift)}</b><small>{shiftTimes[store][shift][0]}—{shiftTimes[store][shift][1]}</small></span><i>1 SS ＋ 1 BB</i></div>)}{period.middleShifts.filter((item) => item.day === dayIndex && item.store === store).map((item) => <div className="middle-demand" key={item.id}><span><b>{item.name}</b><small>{item.start}—{item.end} · {item.headcount}人 · {requirementLabel(item.requirement)}</small></span><button onClick={() => onDelete(item.id)}>删除</button></div>)}{!period.middleShifts.some((item) => item.day === dayIndex && item.store === store) && <p className="empty-copy">当天没有额外中班。</p>}</div></article>)}</div></>;
 }
 
-function SchedulePanel({ period, dates, staff, dayIndex, onDay, view, onView, onSlot, onRun, onUndo, canUndo, onPublish, hardWarnings, onExportImage, onExportExcel }: { period: PeriodState; dates: string[]; staff: Staff[]; dayIndex: number; onDay: (day: number) => void; view: "daily" | "week" | "period"; onView: (view: "daily" | "week" | "period") => void; onSlot: (id: string) => void; onRun: () => void; onUndo: () => void; canUndo: boolean; onPublish: () => void; hardWarnings: string[]; onExportImage: () => void; onExportExcel: () => void }) {
+function SchedulePanel({ period, dates, staff, dayIndex, onDay, view, onView, onSlot, onRun, onUndo, canUndo, onPublish, hardWarnings, onExportImage, onExportExcel, readOnly = false }: { period: PeriodState; dates: string[]; staff: Staff[]; dayIndex: number; onDay: (day: number) => void; view: "daily" | "week" | "period"; onView: (view: "daily" | "week" | "period") => void; onSlot: (id: string) => void; onRun: () => void; onUndo: () => void; canUndo: boolean; onPublish: () => void; hardWarnings: string[]; onExportImage: () => void; onExportExcel: () => void; readOnly?: boolean }) {
   const shownDates = view === "week" ? dates.slice(Math.floor(dayIndex / 7) * 7, Math.floor(dayIndex / 7) * 7 + 7) : dates;
   return <><div className="section-heading"><div><p className="section-kicker">03 / SCHEDULE</p><h2>两店班表</h2><p>{period.status === "published" ? `已发布 V${period.version}` : period.status === "adjusted" ? "已发布后存在临时调整" : "排班草稿"}</p></div></div><div className="view-switch"><button className={view === "daily" ? "active" : ""} onClick={() => onView("daily")}>每日班表</button><button className={view === "week" ? "active" : ""} onClick={() => onView("week")}>周视图</button><button className={view === "period" ? "active" : ""} onClick={() => onView("period")}>周期总览</button></div>
     {view === "daily" ? <><DateStrip dates={dates} active={dayIndex} onChange={onDay} /><div className="store-stack">{stores.map((store, index) => <StoreSchedule key={store} store={store} storeIndex={index} day={dayIndex} assignments={period.assignments} staff={staff} onSlot={onSlot} />)}</div></> : <RosterTable dates={shownDates} allDates={dates} staff={staff} assignments={period.assignments} />}
-    <div className="schedule-toolbar"><button onClick={onRun}><Sparkles />自动排班</button><button onClick={onUndo} disabled={!canUndo}><RotateCcw />撤销</button><button onClick={onExportImage}><ImageDown />长图</button><button onClick={onExportExcel}><Download />Excel</button></div>
-    <button className={`publish-button ${period.status === "published" ? "published" : ""}`} disabled={hardWarnings.length > 0} onClick={onPublish}>{hardWarnings.length ? `先处理 ${hardWarnings.length} 个硬规则问题` : period.status === "published" ? <><Lock />班表已发布并锁定</> : <><Check />发布并锁定班表</>}</button>
+    <div className="schedule-toolbar">{!readOnly && <><button onClick={onRun}><Sparkles />自动排班</button><button onClick={onUndo} disabled={!canUndo}><RotateCcw />撤销</button></>}<button onClick={onExportImage}><ImageDown />长图</button><button onClick={onExportExcel}><Download />Excel</button></div>
+    {!readOnly && <button className={`publish-button ${period.status === "published" ? "published" : ""}`} disabled={hardWarnings.length > 0} onClick={onPublish}>{hardWarnings.length ? `先处理 ${hardWarnings.length} 个硬规则问题` : period.status === "published" ? <><Lock />班表已发布并锁定</> : <><Check />发布并锁定班表</>}</button>}
     {period.warnings.length > 0 && <WarningPanel warnings={period.warnings} />}</>;
 }
 
@@ -302,6 +424,10 @@ function RosterTable({ dates, allDates, staff, assignments }: { dates: string[];
 }
 
 function WarningPanel({ warnings, onMore }: { warnings: string[]; onMore?: () => void }) { return <section className="warning-panel"><div className="warning-head"><AlertTriangle /><b>排班提醒</b><span>{warnings.length}</span></div>{warnings.map((warning, index) => <p className={warning.startsWith("【硬】") ? "hard" : "soft"} key={`${warning}-${index}`}>{warning}</p>)}{onMore && <button onClick={onMore}>查看全部提醒</button>}</section>; }
+
+function ManagerLoginDialog({ open, onOpen, draft, setDraft, status, onSignIn, onCreate }: { open: boolean; onOpen: (open: boolean) => void; draft: { email: string; password: string }; setDraft: (value: { email: string; password: string }) => void; status: string; onSignIn: () => void; onCreate: () => void }) {
+  return <Dialog open={open} onOpenChange={onOpen}><DialogContent className="editor-dialog"><DialogHeader><DialogTitle>店长登录</DialogTitle><DialogDescription>员工直接查看已发布班表；只有店长登录后可以编辑。首次使用可创建唯一的店长账号。</DialogDescription></DialogHeader><div className="form-grid"><label className="wide">邮箱<input type="email" autoComplete="email" value={draft.email} onChange={(event) => setDraft({ ...draft, email: event.target.value })} /></label><label className="wide">密码<input type="password" autoComplete="current-password" value={draft.password} onChange={(event) => setDraft({ ...draft, password: event.target.value })} /></label></div>{status && <p className="login-status">{status}</p>}<div className="login-actions"><button className="dialog-submit" onClick={onSignIn}>登录店长模式</button><button className="secondary-submit" onClick={onCreate}>首次创建店长账号</button></div></DialogContent></Dialog>;
+}
 
 function PeriodEditor({ draft, setDraft, editing, onSave }: { draft: { title: string; startDate: string; endDate: string; deadline: string }; setDraft: (draft: { title: string; startDate: string; endDate: string; deadline: string }) => void; editing: boolean; onSave: () => void }) { return <><DialogHeader><DialogTitle>{editing ? "编辑排班周期" : "新建排班周期"}</DialogTitle><DialogDescription>日期范围可以是任意天数，也可以跨周、跨月。</DialogDescription></DialogHeader><div className="form-grid"><label className="wide">周期名称<input value={draft.title} onChange={(event) => setDraft({ ...draft, title: event.target.value })} placeholder="留空将按日期生成" /></label><label>开始日期<input type="date" value={draft.startDate} onChange={(event) => setDraft({ ...draft, startDate: event.target.value })} /></label><label>结束日期<input type="date" min={draft.startDate} value={draft.endDate} onChange={(event) => setDraft({ ...draft, endDate: event.target.value })} /></label><label className="wide">收集截止提醒<input type="datetime-local" value={draft.deadline} onChange={(event) => setDraft({ ...draft, deadline: event.target.value })} /></label></div><button className="dialog-submit" onClick={onSave}>{editing ? "保存周期设置" : "创建并开始录入"}</button></>; }
 

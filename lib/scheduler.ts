@@ -49,6 +49,29 @@ export function emptyPeriod(staff: Staff[], startDate: string, endDate: string, 
 }
 export function initialState(): AppState { return { version: 2, staff: defaultStaff, periods: {} }; }
 
+export function publicScheduleState(state: AppState): AppState {
+  const staff = state.staff.filter((person) => person.active).map((person) => ({
+    id: person.id,
+    name: person.name,
+    store: person.store,
+    role: person.role,
+    employment: person.employment,
+    active: true,
+  }));
+  const periods = Object.fromEntries(Object.entries(state.periods)
+    .filter(([, period]) => period.status === "published" || period.status === "adjusted")
+    .map(([key, period]) => [key, {
+      ...period,
+      deadline: undefined,
+      availability: {},
+      customTimes: {},
+      participation: {},
+      warnings: [],
+      activities: [],
+    }]));
+  return { version: 2, staff, periods };
+}
+
 type LegacyWeek = { availability?: Record<string, Availability[]>; middleShifts?: Array<Partial<MiddleShift> & { role?: Role }>; assignments?: Assignment[]; warnings?: string[]; published?: boolean };
 export function migrateState(raw: unknown): AppState {
   if (!raw || typeof raw !== "object") return initialState();
@@ -95,7 +118,8 @@ export function generateSchedule(staff: Staff[], period: PeriodState) {
   const standard: Assignment[] = [];
   for (let day = 0; day < dates.length; day += 1) for (const store of stores) for (const shift of ["early", "late"] as const) { const [start, end] = shiftTimes[store][shift]; for (const role of ["SS", "BB"] as const) standard.push({ id: `${day}-${store}-${shift}-${role}`, day, store, shift, role, start, end, staffId: null, locked: false }); }
   const middle = period.middleShifts.flatMap<Assignment>((item) => {
-    const roles: SlotRole[] = item.requirement === "SS_BB" ? ["SS", "BB"] : Array.from({ length: item.headcount }, (_, index) => index === 0 && item.requirement !== "ANY" ? item.requirement : "ANY");
+    const requiredRole: SlotRole = item.requirement === "SS" || item.requirement === "BB" ? item.requirement : "ANY";
+    const roles: SlotRole[] = item.requirement === "SS_BB" ? ["SS", "BB"] : Array.from({ length: item.headcount }, (_, index) => index === 0 ? requiredRole : "ANY");
     return roles.map((role, index) => ({ id: `${item.id}-${index}`, day: item.day, store: item.store, shift: "middle", role, start: item.start, end: item.end, staffId: null, locked: false, middleId: item.id }));
   });
   const previous = new Map(period.assignments.map((item) => [item.id, item]));
