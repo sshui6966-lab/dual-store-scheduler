@@ -17,8 +17,16 @@ function confirmEveryone(staff: Staff[], startDate: string, endDate: string) {
   period.availability.lisir[6] = "off";
   const result = generateSchedule(staff, period);
   const count = (staffId: string) => result.assignments.filter((slot) => slot.staffId === staffId).length;
+  const lisirSlots = result.assignments.filter((slot) => slot.staffId === "lisir");
+  const lisirEarly = lisirSlots.filter((slot) => slot.shift === "early").length;
+  const lisirLate = lisirSlots.filter((slot) => slot.shift === "late").length;
+  const lisirLateToEarly = lisirSlots.filter((slot) => slot.shift === "early" && lisirSlots.some((other) => other.day === slot.day - 1 && other.shift === "late")).length;
 
   assert.equal(count("lisir"), 6, "lisir reports six days and should receive six compatible shifts");
+  assert.ok(lisirSlots.every((slot) => slot.store === "星光店"), "lisir should stay at the home store when compatible home-store shifts are available");
+  assert.ok(Math.abs(lisirEarly - lisirLate) <= 1, `lisir's flexible shifts should be balanced, got ${lisirEarly} early and ${lisirLate} late`);
+  assert.ok(lisirLateToEarly <= 1, `lisir should avoid repeated late-to-early transitions, got ${lisirLateToEarly}`);
+  assert.ok(result.assignments.filter((slot) => slot.staffId).every((slot) => { const person = staff.find((candidate) => candidate.id === slot.staffId); return person?.id === "jennifer" || person?.role !== "SS" || person?.store === slot.store; }), "the fully available SS roster should not create unnecessary cross-store assignments");
   for (const person of staff.filter((candidate) => candidate.employment === "全职")) {
     assert.ok(count(person.id) <= 5, `${person.name} should not reach a sixth day while part-time demand can cover shifts`);
   }

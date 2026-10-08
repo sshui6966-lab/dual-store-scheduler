@@ -158,6 +158,7 @@ export function generateSchedule(staff: Staff[], period: PeriodState) {
         // This is a real priority tier, not one more additive score: an
         // under-filled part timer always ranks ahead of a full timer.
         workTier: person.employment === "兼职" && total < desired ? 0 : person.employment === "全职" && total < fullTimeTarget ? 1 : 2,
+        crossStore: person.store === slot.store || person.id === "jennifer" ? 0 : 1,
         fulfillment: person.employment === "兼职" ? total / desired : total,
         scarcity: person.employment === "兼职" ? desired : dates.length + 1,
         lateToEarly: prior?.day === slot.day - 1 && prior.shift === "late" && slot.shift === "early" ? 1 : 0,
@@ -165,10 +166,10 @@ export function generateSchedule(staff: Staff[], period: PeriodState) {
         imbalance: Math.abs(projectedEarly - projectedLate),
         noviceWithoutFullTimeLeader: person.novice && !person.mature && !fullTimeLeader ? 1 : 0,
         preferenceMiss: person.preference === "early" && slot.shift === "late" ? 1 : 0,
-        crossStore: person.store === slot.store || person.id === "jennifer" ? 0 : 1,
         total,
       };
     }).sort((a, b) => a.workTier - b.workTier
+      || a.crossStore - b.crossStore
       || a.fulfillment - b.fulfillment
       || a.scarcity - b.scarcity
       || a.lateToEarly - b.lateToEarly
@@ -176,7 +177,6 @@ export function generateSchedule(staff: Staff[], period: PeriodState) {
       || a.imbalance - b.imbalance
       || a.noviceWithoutFullTimeLeader - b.noviceWithoutFullTimeLeader
       || a.preferenceMiss - b.preferenceMiss
-      || a.crossStore - b.crossStore
       || a.total - b.total
       || a.person.name.localeCompare(b.person.name))[0]?.person;
     const preferredRoles: Role[] = slot.role === "ANY" ? ["SS", "BB"] : [slot.role];
@@ -184,36 +184,113 @@ export function generateSchedule(staff: Staff[], period: PeriodState) {
     if (preferred) return preferred;
     if (!slot.middleId && slot.role === "BB") return rank(["SS"]);
   };
-  const openSlots = assignments.filter((slot) => !slot.locked).sort((a, b) => a.day - b.day || (a.role === "SS" ? -1 : a.role === "BB" ? 1 : 0));
+  const roleOrder: Record<SlotRole, number> = { SS: 0, BB: 1, ANY: 2 };
+  const openSlots = assignments.filter((slot) => !slot.locked).sort((a, b) => {
+    if (a.day !== b.day) return a.day - b.day;
+    const storeDifference = stores.indexOf(a.store) - stores.indexOf(b.store);
+    if (storeDifference) return storeDifference;
+    const shiftOrder = a.day < Math.ceil(dates.length / 2) ? ["early", "late", "middle"] : ["late", "early", "middle"];
+    const shiftDifference = shiftOrder.indexOf(a.shift) - shiftOrder.indexOf(b.shift);
+    if (shiftDifference) return shiftDifference;
+    return roleOrder[a.role] - roleOrder[b.role] || a.id.localeCompare(b.id);
+  });
   for (const slot of openSlots) { const selected = choose(slot); if (selected) { slot.staffId = selected.id; const match = availabilityMatch(period, selected.id, slot.day, slot.shift, slot.start, slot.end); if (match?.adjusted && match.window) { slot.start = match.window.start; slot.end = match.window.end; slot.customTime = true; } record(slot, selected.id); } }
-  // Full-period audit: if an unlocked full-time assignment can be handed to
-  // an under-filled, same-role part timer without breaking a hard rule, do it.
-  // This catches any locally-greedy choice that survived the first pass.
+  const baseTimes = (slot: Assignment): [string, string] => shiftTimes[slot.store][slot.shift as "early" | "late"];
+  const applyPerson = (slot: Assignment, person: Staff) => {
+    const [start, end] = baseTimes(slot);
+    slot.staffId = person.id; slot.start = start; slot.end = end; slot.customTime = false;
+    const match = availabilityMatch(period, person.id, slot.day, slot.shift, start, end);
+    if (match?.adjusted && match.window) { slot.start = match.window.start; slot.end = match.window.end; slot.customTime = true; }
+  };
+  const canMoveTo = (person: Staff, slot: Assignment, ignoredIds: Set<string>) => {
+    const [start, end] = baseTimes(slot);
+    if (!availabilityMatch(period, person.id, slot.day, slot.shift, start, end)) return false;
+    if (assignments.some((other) => other.staffId === person.id && other.day === slot.day && !ignoredIds.has(other.id))) return false;
+    const proposed = new Set(assignments.filter((other) => other.staffId === person.id && !ignoredIds.has(other.id)).map((other) => other.day));
+    proposed.add(slot.day);
+    return maxConsecutive(proposed, dates.length) <= 6;
+  };
+
+  // Fill remaining part-time demand by choosing the best compatible full-time
+  // slot across the whole period. Home-store and shift balance are evaluated
+  // before a replacement is accepted.
   let changed = true;
   while (changed) {
     changed = false;
     rebuildStats();
     const fullTimeSlots = assignments.filter((slot) => !slot.locked && !slot.middleId && slot.staffId && staff.find((person) => person.id === slot.staffId)?.employment === "全职");
-    for (const slot of fullTimeSlots) {
-      const current = staff.find((person) => person.id === slot.staffId);
-      if (!current) continue;
-      const [baseStart, baseEnd] = shiftTimes[slot.store][slot.shift as "early" | "late"];
-      const candidates = active.filter((person) => person.employment === "兼职" && person.role === current.role)
-        .filter((person) => (counts.get(person.id) ?? 0) < requestedDays(person))
-        .filter((person) => !(usedByDay.get(slot.day)?.has(person.id)))
-        .filter((person) => availabilityMatch(period, person.id, slot.day, slot.shift, baseStart, baseEnd))
-        .filter((person) => { const proposed = new Set(workedDays.get(person.id) ?? []); proposed.add(slot.day); return maxConsecutive(proposed, dates.length) <= 6; })
-        .sort((a, b) => ((counts.get(a.id) ?? 0) / Math.max(1, requestedDays(a))) - ((counts.get(b.id) ?? 0) / Math.max(1, requestedDays(b))) || a.name.localeCompare(b.name));
-      const replacement = candidates[0];
-      if (!replacement) continue;
-      slot.staffId = replacement.id;
-      slot.start = baseStart;
-      slot.end = baseEnd;
-      slot.customTime = false;
-      const match = availabilityMatch(period, replacement.id, slot.day, slot.shift, baseStart, baseEnd);
-      if (match?.adjusted && match.window) { slot.start = match.window.start; slot.end = match.window.end; slot.customTime = true; }
+    const options = active.filter((person) => person.employment === "兼职" && (counts.get(person.id) ?? 0) < requestedDays(person)).flatMap((person) => fullTimeSlots.flatMap((slot) => {
+      const current = staff.find((candidate) => candidate.id === slot.staffId);
+      if (!current || current.role !== person.role || !canMoveTo(person, slot, new Set([slot.id]))) return [];
+      const mix = shiftCounts.get(person.id) ?? { early: 0, late: 0 };
+      const projectedEarly = mix.early + (slot.shift === "early" ? 1 : 0);
+      const projectedLate = mix.late + (slot.shift === "late" ? 1 : 0);
+      const previousLate = assignments.some((other) => other.staffId === person.id && other.day === slot.day - 1 && other.shift === "late");
+      return [{
+        person, slot,
+        fullTimeOverTarget: (counts.get(current.id) ?? 0) > fullTimeTarget ? 0 : 1,
+        crossStore: person.store === slot.store || person.id === "jennifer" ? 0 : 1,
+        fulfillment: (counts.get(person.id) ?? 0) / Math.max(1, requestedDays(person)),
+        lateToEarly: previousLate && slot.shift === "early" ? 1 : 0,
+        imbalance: Math.abs(projectedEarly - projectedLate),
+      }];
+    })).sort((a, b) => a.fullTimeOverTarget - b.fullTimeOverTarget
+      || a.crossStore - b.crossStore
+      || a.fulfillment - b.fulfillment
+      || a.lateToEarly - b.lateToEarly
+      || a.imbalance - b.imbalance
+      || a.slot.day - b.slot.day
+      || a.person.name.localeCompare(b.person.name));
+    const best = options[0];
+    if (best) {
+      applyPerson(best.slot, best.person);
       changed = true;
-      break;
+    }
+  }
+  rebuildStats();
+
+  const optimizationVector = () => {
+    let lateToEarly = 0; let crossStore = 0; let imbalance = 0; let preferenceMiss = 0; let pairingConflict = 0; let noviceLeader = 0;
+    active.forEach((person) => {
+      const slots = assignments.filter((slot) => slot.staffId === person.id);
+      if (person.id !== "jennifer") crossStore += slots.filter((slot) => slot.store !== person.store).length;
+      const early = slots.filter((slot) => slot.shift === "early").length; const late = slots.filter((slot) => slot.shift === "late").length;
+      imbalance += (early - late) ** 2;
+      if (person.preference === "early") preferenceMiss += late;
+      if (slots.some((slot) => slot.shift === "early" && assignments.some((other) => other.staffId === person.id && other.day === slot.day - 1 && other.shift === "late"))) lateToEarly += 1;
+    });
+    const groups = new Map<string, Assignment[]>();
+    assignments.filter((slot) => slot.staffId).forEach((slot) => groups.set(slotGroup(slot), [...(groups.get(slotGroup(slot)) ?? []), slot]));
+    groups.forEach((slots) => {
+      const people = slots.flatMap((slot) => { const person = staff.find((candidate) => candidate.id === slot.staffId); return person ? [person] : []; });
+      if (people.some(isStefan) && people.some(isNemo)) pairingConflict += 1;
+      const hasFullTimeSS = people.some((person) => person.role === "SS" && person.employment === "全职");
+      if (!hasFullTimeSS && people.some((person) => person.novice && !person.mature)) noviceLeader += 1;
+    });
+    return [crossStore, lateToEarly, imbalance, preferenceMiss, pairingConflict, noviceLeader];
+  };
+  const isBetter = (next: number[], current: number[]) => { for (let index = 0; index < next.length; index += 1) { if (next[index] !== current[index]) return next[index] < current[index]; } return false; };
+
+  // Swap already-assigned people without changing anyone's number of days.
+  // This removes reciprocal cross-store support and balances early/late work.
+  let optimized = true; let optimizationPasses = 0;
+  while (optimized && optimizationPasses < 100) {
+    optimized = false; optimizationPasses += 1;
+    const baseline = optimizationVector();
+    const swappable = assignments.filter((slot) => !slot.locked && !slot.middleId && slot.staffId);
+    outer: for (let left = 0; left < swappable.length; left += 1) for (let right = left + 1; right < swappable.length; right += 1) {
+      const first = swappable[left]; const second = swappable[right];
+      if (first.staffId === second.staffId) continue;
+      const firstPerson = staff.find((person) => person.id === first.staffId); const secondPerson = staff.find((person) => person.id === second.staffId);
+      if (!firstPerson || !secondPerson || firstPerson.role !== secondPerson.role) continue;
+      const ignored = new Set([first.id, second.id]);
+      if (!canMoveTo(firstPerson, second, ignored) || !canMoveTo(secondPerson, first, ignored)) continue;
+      const firstSnapshot = { staffId: first.staffId, start: first.start, end: first.end, customTime: first.customTime };
+      const secondSnapshot = { staffId: second.staffId, start: second.start, end: second.end, customTime: second.customTime };
+      applyPerson(first, secondPerson); applyPerson(second, firstPerson);
+      const next = optimizationVector();
+      if (isBetter(next, baseline)) { optimized = true; rebuildStats(); break outer; }
+      Object.assign(first, firstSnapshot); Object.assign(second, secondSnapshot);
     }
   }
   rebuildStats();
