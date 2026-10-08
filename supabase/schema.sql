@@ -50,8 +50,8 @@ begin
 end;
 $$;
 
-revoke execute on function public.is_scheduler_manager() from public, anon;
-grant execute on function public.is_scheduler_manager() to authenticated;
+revoke execute on function public.is_scheduler_manager() from public;
+grant execute on function public.is_scheduler_manager() to anon, authenticated;
 revoke execute on function public.claim_scheduler_manager() from public, anon;
 grant execute on function public.claim_scheduler_manager() to authenticated;
 
