@@ -256,8 +256,6 @@ export function generateSchedule(staff: Staff[], period: PeriodState) {
     if (slots.length !== 2 || slots.some((slot) => !slot.staffId)) return;
     const roles = slots.map((slot) => staff.find((person) => person.id === slot.staffId)?.role);
     if (roles.every((role) => role === "SS")) warnings.push(`【提醒】${dateLabel(dates[slots[0].day])}｜${slots[0].store}｜${shiftLabel(slots[0].shift)}：暂无可用BB，已由2名SS覆盖。`);
-    const people = slots.flatMap((slot) => { const person = staff.find((candidate) => candidate.id === slot.staffId); return person ? [person] : []; });
-    if (people.some(isStefan) && people.some(isNemo)) warnings.push(`【提醒】${dateLabel(dates[slots[0].day])}｜${slots[0].store}｜${shiftLabel(slots[0].shift)}：Stefan（双林）与nemo因班次覆盖需要同班。`);
   });
   assignments.filter((slot) => slot.staffId && slot.customTime).forEach((slot) => {
     const person = staff.find((candidate) => candidate.id === slot.staffId);
