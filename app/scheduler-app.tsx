@@ -272,7 +272,7 @@ export function SchedulerApp() {
     if (!period) return;
     const header = ["员工", "身份", ...dates.map(dateLabel), "本周期工时"];
     const rows = state.staff.filter((person) => person.active).map((person) => [person.name, `${person.employment}${person.role}`, ...dates.map((_, day) => {
-      const slot = period.assignments.find((item) => item.day === day && item.staffId === person.id); return slot ? `${slot.store}${shiftLabel(slot.shift)}` : "休";
+      const slot = period.assignments.find((item) => item.day === day && item.staffId === person.id); return slot ? `${slot.store}${shiftLabel(slot.shift)} ${slot.start}–${slot.end}` : "休";
     }), (staffHours.get(person.id) ?? 0).toFixed(2)]);
     const html = `<html><head><meta charset="UTF-8"></head><body><table border="1"><tr>${header.map((cell) => `<th>${cell}</th>`).join("")}</tr>${rows.map((row) => `<tr>${row.map((cell) => `<td>${cell}</td>`).join("")}</tr>`).join("")}</table></body></html>`;
     downloadBlob(new Blob([html], { type: "application/vnd.ms-excel;charset=utf-8" }), `${safeFilename(period.title)}-班表.xls`);
@@ -300,9 +300,9 @@ export function SchedulerApp() {
   const exportImage = () => {
     if (!period) return;
     const people = state.staff.filter((person) => person.active && period.assignments.some((item) => item.staffId === person.id));
-    const nameWidth = 190; const hoursWidth = 105; const columnWidth = 86;
+    const nameWidth = 190; const hoursWidth = 105; const columnWidth = 108;
     const width = Math.max(1080, nameWidth + hoursWidth + dates.length * columnWidth + 60);
-    const rowHeight = 58; const tableTop = 224; const height = tableTop + 48 + people.length * rowHeight + 34;
+    const rowHeight = 68; const tableTop = 224; const height = tableTop + 48 + people.length * rowHeight + 34;
     const canvas = document.createElement("canvas"); canvas.width = width; canvas.height = height; const ctx = canvas.getContext("2d"); if (!ctx) return;
     ctx.fillStyle = "#f7f3e8"; ctx.fillRect(0, 0, width, height); ctx.fillStyle = "#720020"; ctx.fillRect(0, 0, width, 130); ctx.fillStyle = "#fffaf0"; ctx.font = "bold 42px Arial"; ctx.fillText("双店排班表", 48, 58); ctx.font = "26px Arial"; ctx.fillText(`${shortDate(period.startDate)} — ${shortDate(period.endDate)} · 版本 ${period.version || "草稿"}`, 48, 103);
     const drawLegend = (x: number, color: string, label: string) => { ctx.fillStyle = color; ctx.fillRect(x, 154, 28, 22); ctx.strokeStyle = "#35283c"; ctx.lineWidth = 2; ctx.strokeRect(x, 154, 28, 22); ctx.fillStyle = "#35283c"; ctx.font = "bold 18px Arial"; ctx.fillText(label, x + 38, 172); };
@@ -311,7 +311,7 @@ export function SchedulerApp() {
     dates.forEach((date, index) => ctx.fillText(shortDate(date).replace("月", "/").replace("日", ""), nameWidth + index * columnWidth, tableTop + 31));
     ctx.fillText("工时", nameWidth + dates.length * columnWidth, tableTop + 31);
     people.forEach((person, row) => {
-      const y = tableTop + 48 + row * rowHeight; const textY = y + 35;
+      const y = tableTop + 48 + row * rowHeight; const textY = y + 29;
       ctx.fillStyle = row % 2 ? "#eee8d5" : "#fffaf0"; ctx.fillRect(20, y, nameWidth - 20, rowHeight - 2);
       ctx.fillStyle = "#35283c"; ctx.font = "bold 20px Arial"; ctx.fillText(person.name, 34, textY);
       ctx.font = "17px Arial";
@@ -321,7 +321,8 @@ export function SchedulerApp() {
         ctx.fillStyle = slot?.store === "星光店" ? "#d7e2f2" : slot?.store === "开元店" ? "#d3ead2" : "#fffaf0";
         ctx.fillRect(x - 10, y, columnWidth, rowHeight - 2);
         ctx.fillStyle = "#35283c";
-        ctx.fillText(slot ? `${slot.store === "星光店" ? "星" : "开"}${shiftLabel(slot.shift).slice(0, 1)}` : "休", x, textY);
+        ctx.fillText(slot ? `${slot.store === "星光店" ? "星" : "开"}${shiftLabel(slot.shift).slice(0, 1)}` : "休", x, slot ? textY : y + 40);
+        if (slot) { ctx.font = "14px Arial"; ctx.fillText(`${slot.start}–${slot.end}`, x, y + 52); ctx.font = "17px Arial"; }
       });
       ctx.fillStyle = "#eee8d5"; ctx.fillRect(nameWidth + dates.length * columnWidth - 10, y, hoursWidth, rowHeight - 2);
       ctx.fillStyle = "#35283c"; ctx.font = "bold 18px Arial"; ctx.fillText(`${(staffHours.get(person.id) ?? 0).toFixed(2)}h`, nameWidth + dates.length * columnWidth, textY);
@@ -417,11 +418,11 @@ function DateStrip({ dates, active, onChange }: { dates: string[]; active: numbe
 
 function StoreSchedule({ store, storeIndex, day, assignments, staff, onSlot }: { store: Store; storeIndex: number; day: number; assignments: Assignment[]; staff: Staff[]; onSlot: (id: string) => void }) {
   const today = assignments.filter((item) => item.day === day && item.store === store);
-  return <article className={`store-card store-${storeIndex}`}><div className="store-head"><div><StoreIcon /><b>{store}</b></div><span>{today.filter((item) => item.staffId).length}人已排</span></div><div className="shift-list">{(["early", "middle", "late"] as const).map((shift) => { const slots = today.filter((item) => item.shift === shift); if (shift === "middle" && !slots.length) return null; return <div className="shift-row" key={shift}><div className="shift-time"><b>{shiftLabel(shift)}</b><span>{slots[0] ? `${slots[0].start}—${slots[0].end}` : "待生成"}</span></div><div className="slot-group">{slots.length ? slots.map((slot) => { const person = staff.find((item) => item.id === slot.staffId); const roleLabel = person?.role ?? (slot.role === "ANY" ? "人" : slot.role); const missingLabel = !slot.middleId && slot.role === "BB" ? "SS或BB" : slot.role === "ANY" ? "1人" : slot.role; return <button key={slot.id} onClick={() => onSlot(slot.id)} className={`staff-slot ${person ? "filled" : "empty"}`}><i>{roleLabel}</i><span><b>{person?.name ?? `缺${missingLabel}`}</b><small>{person ? person.store === store ? person.employment : `${person.store}支援` : "需外店支援"}</small></span>{slot.locked && <Lock />}</button>; }) : <p className="empty-copy">请先生成班表</p>}</div></div>; })}</div></article>;
+  return <article className={`store-card store-${storeIndex}`}><div className="store-head"><div><StoreIcon /><b>{store}</b></div><span>{today.filter((item) => item.staffId).length}人已排</span></div><div className="shift-list">{(["early", "middle", "late"] as const).map((shift) => { const slots = today.filter((item) => item.shift === shift); if (shift === "middle" && !slots.length) return null; return <div className="shift-row" key={shift}><div className="shift-time"><b>{shiftLabel(shift)}</b><span>{slots[0] ? `${slots[0].start}—${slots[0].end}` : "待生成"}</span></div><div className="slot-group">{slots.length ? slots.map((slot) => { const person = staff.find((item) => item.id === slot.staffId); const roleLabel = person?.role ?? (slot.role === "ANY" ? "人" : slot.role); const missingLabel = !slot.middleId && slot.role === "BB" ? "SS或BB" : slot.role === "ANY" ? "1人" : slot.role; return <button key={slot.id} onClick={() => onSlot(slot.id)} className={`staff-slot ${person ? "filled" : "empty"}`}><i>{roleLabel}</i><span><b>{person?.name ?? `缺${missingLabel}`}</b><small>{person ? `${person.store === store ? person.employment : `${person.store}支援`} · ${slot.start}—${slot.end}` : "需外店支援"}</small></span>{slot.locked && <Lock />}</button>; }) : <p className="empty-copy">请先生成班表</p>}</div></div>; })}</div></article>;
 }
 
 function RosterTable({ dates, allDates, staff, assignments }: { dates: string[]; allDates: string[]; staff: Staff[]; assignments: Assignment[] }) {
-  return <div className="roster-wrap"><table className="roster-table"><thead><tr><th>员工</th>{dates.map((date) => <th key={date}>{dateLabel(date)}</th>)}<th>工时</th></tr></thead><tbody>{staff.filter((person) => person.active).map((person) => { const personAssignments = assignments.filter((item) => item.staffId === person.id); return <tr key={person.id}><th><b>{person.name}</b><small>{person.role} · {person.store}</small></th>{dates.map((date) => { const day = allDates.indexOf(date); const item = personAssignments.find((slot) => slot.day === day); return <td key={date} className={item ? `cell-${item.store === "星光店" ? "blue" : "green"}` : ""}>{item ? <><b>{item.store.slice(0, 2)}</b><span>{shiftLabel(item.shift)}</span></> : <span className="rest-cell">休</span>}</td>; })}<td><b>{personAssignments.reduce((sum, item) => sum + hoursFor(item), 0).toFixed(2)}</b></td></tr>; })}</tbody></table></div>;
+  return <div className="roster-wrap"><table className="roster-table"><thead><tr><th>员工</th>{dates.map((date) => <th key={date}>{dateLabel(date)}</th>)}<th>工时</th></tr></thead><tbody>{staff.filter((person) => person.active).map((person) => { const personAssignments = assignments.filter((item) => item.staffId === person.id); return <tr key={person.id}><th><b>{person.name}</b><small>{person.role} · {person.store}</small></th>{dates.map((date) => { const day = allDates.indexOf(date); const item = personAssignments.find((slot) => slot.day === day); return <td key={date} className={item ? `cell-${item.store === "星光店" ? "blue" : "green"}` : ""}>{item ? <><b>{item.store.slice(0, 2)}</b><span>{shiftLabel(item.shift)}</span><small>{item.start}—{item.end}</small></> : <span className="rest-cell">休</span>}</td>; })}<td><b>{personAssignments.reduce((sum, item) => sum + hoursFor(item), 0).toFixed(2)}</b></td></tr>; })}</tbody></table></div>;
 }
 
 function WarningPanel({ warnings, onWarning, onMore }: { warnings: string[]; onWarning?: (warning: string) => void; onMore?: () => void }) { return <section className="warning-panel"><div className="warning-head"><AlertTriangle /><b>排班提醒</b><span>{warnings.length}</span></div><div className="warning-list">{warnings.map((warning, index) => { const level = warning.startsWith("【硬】") ? "hard" : warning.startsWith("【注意】") ? "caution" : "soft"; return <button className={`warning-item ${level}`} disabled={!onWarning} onClick={() => onWarning?.(warning)} key={`${warning}-${index}`}><span>{warning}</span>{onWarning && <i>查看</i>}</button>; })}</div>{onMore && <button className="warning-more" onClick={onMore}>查看全部提醒</button>}</section>; }
