@@ -191,13 +191,33 @@ export function SchedulerApp() {
   };
   const exportImage = () => {
     if (!period) return;
-    const width = 1080; const rowHeight = 58; const height = 190 + state.staff.filter((person) => person.active).length * rowHeight;
+    const people = state.staff.filter((person) => person.active);
+    const nameWidth = 190; const hoursWidth = 105; const columnWidth = 86;
+    const width = Math.max(1080, nameWidth + hoursWidth + dates.length * columnWidth + 60);
+    const rowHeight = 58; const tableTop = 224; const height = tableTop + 48 + people.length * rowHeight + 34;
     const canvas = document.createElement("canvas"); canvas.width = width; canvas.height = height; const ctx = canvas.getContext("2d"); if (!ctx) return;
     ctx.fillStyle = "#f7f3e8"; ctx.fillRect(0, 0, width, height); ctx.fillStyle = "#720020"; ctx.fillRect(0, 0, width, 130); ctx.fillStyle = "#fffaf0"; ctx.font = "bold 42px Arial"; ctx.fillText("双店排班表", 48, 58); ctx.font = "26px Arial"; ctx.fillText(`${shortDate(period.startDate)} — ${shortDate(period.endDate)} · 版本 ${period.version || "草稿"}`, 48, 103);
-    const people = state.staff.filter((person) => person.active); const columnWidth = Math.max(76, Math.min(130, (width - 220) / Math.min(dates.length, 9)));
-    ctx.font = "bold 22px Arial"; ctx.fillStyle = "#35283c"; ctx.fillText("员工", 34, 168);
-    dates.slice(0, 9).forEach((date, index) => ctx.fillText(shortDate(date).replace("月", "/").replace("日", ""), 200 + index * columnWidth, 168));
-    people.forEach((person, row) => { const y = 205 + row * rowHeight; ctx.fillStyle = row % 2 ? "#d2c99b" : "#fffaf0"; ctx.fillRect(20, y - 32, width - 40, rowHeight - 4); ctx.fillStyle = "#35283c"; ctx.font = "bold 22px Arial"; ctx.fillText(person.name, 34, y); ctx.font = "18px Arial"; dates.slice(0, 9).forEach((_, day) => { const slot = period.assignments.find((item) => item.day === day && item.staffId === person.id); ctx.fillText(slot ? `${slot.store.slice(0, 2)}${shiftLabel(slot.shift).slice(0, 1)}` : "休", 200 + day * columnWidth, y); }); });
+    const drawLegend = (x: number, color: string, label: string) => { ctx.fillStyle = color; ctx.fillRect(x, 154, 28, 22); ctx.strokeStyle = "#35283c"; ctx.lineWidth = 2; ctx.strokeRect(x, 154, 28, 22); ctx.fillStyle = "#35283c"; ctx.font = "bold 18px Arial"; ctx.fillText(label, x + 38, 172); };
+    drawLegend(48, "#d7e2f2", "星光店"); drawLegend(190, "#d3ead2", "开元店"); drawLegend(332, "#fffaf0", "休息");
+    ctx.fillStyle = "#35283c"; ctx.fillRect(20, tableTop, width - 40, 48); ctx.fillStyle = "#fffaf0"; ctx.font = "bold 19px Arial"; ctx.fillText("员工", 34, tableTop + 31);
+    dates.forEach((date, index) => ctx.fillText(shortDate(date).replace("月", "/").replace("日", ""), nameWidth + index * columnWidth, tableTop + 31));
+    ctx.fillText("工时", nameWidth + dates.length * columnWidth, tableTop + 31);
+    people.forEach((person, row) => {
+      const y = tableTop + 48 + row * rowHeight; const textY = y + 35;
+      ctx.fillStyle = row % 2 ? "#eee8d5" : "#fffaf0"; ctx.fillRect(20, y, nameWidth - 20, rowHeight - 2);
+      ctx.fillStyle = "#35283c"; ctx.font = "bold 20px Arial"; ctx.fillText(person.name, 34, textY);
+      ctx.font = "17px Arial";
+      dates.forEach((_, day) => {
+        const slot = period.assignments.find((item) => item.day === day && item.staffId === person.id);
+        const x = nameWidth + day * columnWidth;
+        ctx.fillStyle = slot?.store === "星光店" ? "#d7e2f2" : slot?.store === "开元店" ? "#d3ead2" : "#fffaf0";
+        ctx.fillRect(x - 10, y, columnWidth, rowHeight - 2);
+        ctx.fillStyle = "#35283c";
+        ctx.fillText(slot ? `${slot.store === "星光店" ? "星" : "开"}${shiftLabel(slot.shift).slice(0, 1)}` : "休", x, textY);
+      });
+      ctx.fillStyle = "#eee8d5"; ctx.fillRect(nameWidth + dates.length * columnWidth - 10, y, hoursWidth, rowHeight - 2);
+      ctx.fillStyle = "#35283c"; ctx.font = "bold 18px Arial"; ctx.fillText(`${(staffHours.get(person.id) ?? 0).toFixed(2)}h`, nameWidth + dates.length * columnWidth, textY);
+    });
     canvas.toBlob((blob) => blob && downloadBlob(blob, `${safeFilename(period.title)}-班表.png`), "image/png");
   };
 
@@ -243,7 +263,7 @@ export function SchedulerApp() {
 
 function HomePanel({ period, confirmed, unconfirmed, excluded, activeCount, hardWarnings, softWarnings, onAvailability, onDemand, onSchedule, onWarnings, onEditPeriod }: { period: PeriodState; confirmed: number; unconfirmed: number; excluded: number; activeCount: number; hardWarnings: string[]; softWarnings: string[]; onAvailability: () => void; onDemand: () => void; onSchedule: () => void; onWarnings: () => void; onEditPeriod: () => void }) {
   const filled = period.assignments.filter((item) => item.staffId).length;
-  return <><section className="dashboard-grid"><article className="hero-card color-wine"><div className="lamp-geometry" aria-hidden="true"><span /><i /></div><p>信息收集进度</p><strong>{confirmed}<em> / {activeCount}</em></strong><span>未确认 {unconfirmed} 人 · 不参与 {excluded} 人</span><button className="primary-action" onClick={onAvailability}>继续录入</button></article><article className="metric-card color-blue"><CalendarDays /><b>{filled}</b><span>已安排人次</span></article><article className="metric-card color-orange"><AlertTriangle /><b>{hardWarnings.length}</b><span>硬规则问题</span></article></section>
+  return <><section className="dashboard-grid"><article className="hero-card readiness-card"><div className="lamp-geometry" aria-hidden="true"><span /><i /></div><p>本周准备度</p><strong>{confirmed}<em> / {activeCount}</em></strong><div className="readiness-breakdown"><span>已确认 {confirmed}</span><span>未确认 {unconfirmed}</span><span>不参与 {excluded}</span></div><button className="primary-action" onClick={onAvailability}>继续录入</button></article><article className="metric-card color-blue"><CalendarDays /><b>{filled}</b><span>已安排人次</span></article><article className="metric-card color-orange"><AlertTriangle /><b>{hardWarnings.length}</b><span>硬规则问题</span></article></section>
     <section className="period-card"><div><span>当前周期</span><b>{shortDate(period.startDate)}—{shortDate(period.endDate)}</b><small>{dateList(period.startDate, period.endDate).length}天 · {period.deadline ? `截止提醒 ${new Date(period.deadline).toLocaleString("zh-CN")}` : "未设置截止提醒"}</small></div><button onClick={onEditPeriod}>编辑日期</button></section>
     <section className="shortcut-grid"><button onClick={onAvailability}><ClipboardCheck /><b>录入可排时间</b><span>还有{unconfirmed}人待确认</span></button><button onClick={onDemand}><Clock3 /><b>设置中班</b><span>已有{period.middleShifts.length}个中班</span></button><button onClick={onSchedule}><Sparkles /><b>自动排班</b><span>生成当前周期草稿</span></button><button onClick={onWarnings}><ListChecks /><b>查看问题</b><span>{hardWarnings.length + softWarnings.length}条提醒</span></button></section>
     {(hardWarnings.length > 0 || softWarnings.length > 0) && <WarningPanel warnings={[...hardWarnings, ...softWarnings].slice(0, 5)} onMore={onWarnings} />}</>;
@@ -267,7 +287,7 @@ function SchedulePanel({ period, dates, staff, dayIndex, onDay, view, onView, on
 }
 
 function TeamPanel({ staff, hours, onAdd, onEdit }: { staff: Staff[]; hours: Map<string, number>; onAdd: () => void; onEdit: (staff: Staff) => void }) {
-  return <><div className="section-heading"><div><p className="section-kicker">04 / TEAM</p><h2>人员与工时</h2><p>新增员工、调整门店或停用人员。</p></div><button className="small-action accent" onClick={onAdd}><UserPlus />添加员工</button></div><div className="team-grid">{staff.map((person) => <button key={person.id} onClick={() => onEdit(person)} className={`team-card ${person.active ? "" : "inactive"}`}><span className={`role-badge role-${person.role.toLowerCase()}`}>{person.role}</span><b>{person.name}</b><small>{person.store} · {person.employment}</small><strong>{(hours.get(person.id) ?? 0).toFixed(2)}<em>h</em></strong>{person.novice && !person.mature && <i>新员工</i>}{!person.active && <i>已停用</i>}</button>)}</div></>;
+  return <><div className="section-heading"><div><p className="section-kicker">04 / TEAM</p><h2>人员与工时</h2><p>蓝色为星光店，绿色为开元店。</p></div><button className="small-action accent" onClick={onAdd}><UserPlus />添加员工</button></div><div className="team-grid">{staff.map((person) => <button key={person.id} onClick={() => onEdit(person)} className={`team-card ${person.store === "星光店" ? "team-xingguang" : "team-kaiyuan"} ${person.active ? "" : "inactive"}`}><span className={`role-badge role-${person.role.toLowerCase()}`}>{person.role}</span><b>{person.name}</b><small>{person.store} · {person.employment}</small><strong>{(hours.get(person.id) ?? 0).toFixed(2)}<em>h</em></strong>{person.novice && !person.mature && <i>新员工</i>}{!person.active && <i>已停用</i>}</button>)}</div></>;
 }
 
 function DateStrip({ dates, active, onChange }: { dates: string[]; active: number; onChange: (day: number) => void }) { return <div className="date-strip">{dates.map((date, index) => <button key={date} className={index === active ? "active" : ""} onClick={() => onChange(index)}><b>{dateLabel(date).split(" ")[1]}</b><span>{parseDate(date).getDate()}</span><small>{parseDate(date).getMonth() + 1}月</small></button>)}</div>; }
