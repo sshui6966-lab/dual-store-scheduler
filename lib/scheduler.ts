@@ -121,6 +121,7 @@ export function hoursFor(assignment: Assignment) { return Math.max(0, (minutes(a
 export function generateSchedule(staff: Staff[], period: PeriodState) {
   const dates = dateList(period.startDate, period.endDate);
   const fullTimeTarget = Math.min(dates.length, Math.ceil(dates.length * 5 / 7));
+  const fullTimeMinimum = Math.min(dates.length, Math.ceil(dates.length * 4 / 7));
   const active = staff.filter((person) => person.active && period.participation[person.id] !== "excluded");
   const unconfirmed = active.filter((person) => period.participation[person.id] !== "confirmed" || (period.availability[person.id] ?? []).some((value) => value === "unconfirmed"));
   if (unconfirmed.length) return { assignments: period.assignments, warnings: [`【硬】以下人员信息尚未确认：${unconfirmed.map((person) => person.name).join("、")}`] };
@@ -157,7 +158,9 @@ export function generateSchedule(staff: Staff[], period: PeriodState) {
         person,
         // This is a real priority tier, not one more additive score: an
         // under-filled part timer always ranks ahead of a full timer.
-        workTier: person.employment === "兼职" && total < desired ? 0 : person.employment === "全职" && total < fullTimeTarget ? 1 : 2,
+        workTier: person.employment === "全职" && total < fullTimeMinimum ? 0
+          : person.employment === "兼职" && total < desired ? 1
+            : person.employment === "全职" && total < fullTimeTarget ? 2 : 3,
         crossStore: person.store === slot.store || person.id === "jennifer" ? 0 : 1,
         fulfillment: person.employment === "兼职" ? total / desired : total,
         scarcity: person.employment === "兼职" ? desired : dates.length + 1,
@@ -202,7 +205,11 @@ export function generateSchedule(staff: Staff[], period: PeriodState) {
     const match = availabilityMatch(period, person.id, slot.day, slot.shift, start, end);
     if (match?.adjusted && match.window) { slot.start = match.window.start; slot.end = match.window.end; slot.customTime = true; }
   };
+  const roleFitsSlot = (person: Staff, slot: Assignment) => slot.role === "ANY"
+    || person.role === slot.role
+    || (!slot.middleId && slot.role === "BB" && person.role === "SS");
   const canMoveTo = (person: Staff, slot: Assignment, ignoredIds: Set<string>) => {
+    if (!roleFitsSlot(person, slot)) return false;
     const [start, end] = baseTimes(slot);
     if (!availabilityMatch(period, person.id, slot.day, slot.shift, start, end)) return false;
     if (assignments.some((other) => other.staffId === person.id && other.day === slot.day && !ignoredIds.has(other.id))) return false;
@@ -218,7 +225,7 @@ export function generateSchedule(staff: Staff[], period: PeriodState) {
   while (changed) {
     changed = false;
     rebuildStats();
-    const fullTimeSlots = assignments.filter((slot) => !slot.locked && !slot.middleId && slot.staffId && staff.find((person) => person.id === slot.staffId)?.employment === "全职");
+    const fullTimeSlots = assignments.filter((slot) => !slot.locked && !slot.middleId && slot.staffId && staff.find((person) => person.id === slot.staffId)?.employment === "全职" && (counts.get(slot.staffId) ?? 0) > fullTimeMinimum);
     const options = active.filter((person) => person.employment === "兼职" && (counts.get(person.id) ?? 0) < requestedDays(person)).flatMap((person) => fullTimeSlots.flatMap((slot) => {
       const current = staff.find((candidate) => candidate.id === slot.staffId);
       if (!current || current.role !== person.role || !canMoveTo(person, slot, new Set([slot.id]))) return [];
@@ -250,9 +257,10 @@ export function generateSchedule(staff: Staff[], period: PeriodState) {
   rebuildStats();
 
   const optimizationVector = () => {
-    let lateToEarly = 0; let crossStore = 0; let imbalance = 0; let preferenceMiss = 0; let pairingConflict = 0; let noviceLeader = 0;
+    let fullTimeLoad = 0; let lateToEarly = 0; let crossStore = 0; let imbalance = 0; let preferenceMiss = 0; let pairingConflict = 0; let noviceLeader = 0;
     active.forEach((person) => {
       const slots = assignments.filter((slot) => slot.staffId === person.id);
+      if (person.employment === "全职") fullTimeLoad += (slots.length - fullTimeTarget) ** 2;
       if (person.id !== "jennifer") crossStore += slots.filter((slot) => slot.store !== person.store).length;
       const early = slots.filter((slot) => slot.shift === "early").length; const late = slots.filter((slot) => slot.shift === "late").length;
       imbalance += (early - late) ** 2;
@@ -267,12 +275,52 @@ export function generateSchedule(staff: Staff[], period: PeriodState) {
       const hasFullTimeSS = people.some((person) => person.role === "SS" && person.employment === "全职");
       if (!hasFullTimeSS && people.some((person) => person.novice && !person.mature)) noviceLeader += 1;
     });
-    return [crossStore, lateToEarly, imbalance, preferenceMiss, pairingConflict, noviceLeader];
+    // Weekly shift mix is optimized before the late-to-early soft rule. The
+    // previous order treated one transition as a veto and left flexible staff
+    // on all-early or all-late schedules.
+    return [fullTimeLoad, crossStore, imbalance, lateToEarly, preferenceMiss, pairingConflict, noviceLeader];
   };
   const isBetter = (next: number[], current: number[]) => { for (let index = 0; index < next.length; index += 1) { if (next[index] !== current[index]) return next[index] < current[index]; } return false; };
 
+  // The greedy pass can leave one full timer on five days while another
+  // compatible full timer has only three. Move whole assignments between
+  // full timers before shift-mix optimization; part-time totals stay intact.
+  let loadsBalanced = true; let loadPasses = 0;
+  while (loadsBalanced && loadPasses < 100) {
+    loadsBalanced = false; loadPasses += 1;
+    const baseline = optimizationVector();
+    const movable = assignments.filter((slot) => !slot.locked && !slot.middleId && slot.staffId && staff.find((person) => person.id === slot.staffId)?.employment === "全职");
+    outerLoad: for (const slot of movable) {
+      const current = staff.find((person) => person.id === slot.staffId);
+      if (!current) continue;
+      const candidates = active.filter((person) => person.employment === "全职" && person.id !== current.id && person.role === current.role)
+        .sort((a, b) => assignments.filter((item) => item.staffId === a.id).length - assignments.filter((item) => item.staffId === b.id).length || a.name.localeCompare(b.name));
+      for (const candidate of candidates) {
+        if (!canMoveTo(candidate, slot, new Set([slot.id]))) continue;
+        const snapshot = { staffId: slot.staffId, start: slot.start, end: slot.end, customTime: slot.customTime };
+        applyPerson(slot, candidate);
+        const next = optimizationVector();
+        if (isBetter(next, baseline)) { loadsBalanced = true; rebuildStats(); break outerLoad; }
+        Object.assign(slot, snapshot);
+      }
+    }
+  }
+  rebuildStats();
+
+  const affectedGroupsValid = (slots: Assignment[]) => {
+    const keys = new Set(slots.map(slotGroup));
+    return [...keys].every((key) => {
+      const group = assignments.filter((slot) => slotGroup(slot) === key && slot.staffId);
+      if (group.some((slot) => { const person = staff.find((candidate) => candidate.id === slot.staffId); return !person || !roleFitsSlot(person, slot); })) return false;
+      if (group[0]?.middleId) return true;
+      const people = group.flatMap((slot) => { const person = staff.find((candidate) => candidate.id === slot.staffId); return person ? [person] : []; });
+      return people.filter((person) => person.role === "BB").length <= 1 && people.some((person) => person.role === "SS");
+    });
+  };
+
   // Swap already-assigned people without changing anyone's number of days.
-  // This removes reciprocal cross-store support and balances early/late work.
+  // Base BB positions may be covered by an SS, so allow SS/BB exchanges when
+  // both affected shifts still contain an SS and at most one BB.
   let optimized = true; let optimizationPasses = 0;
   while (optimized && optimizationPasses < 100) {
     optimized = false; optimizationPasses += 1;
@@ -282,15 +330,49 @@ export function generateSchedule(staff: Staff[], period: PeriodState) {
       const first = swappable[left]; const second = swappable[right];
       if (first.staffId === second.staffId) continue;
       const firstPerson = staff.find((person) => person.id === first.staffId); const secondPerson = staff.find((person) => person.id === second.staffId);
-      if (!firstPerson || !secondPerson || firstPerson.role !== secondPerson.role) continue;
+      if (!firstPerson || !secondPerson) continue;
       const ignored = new Set([first.id, second.id]);
       if (!canMoveTo(firstPerson, second, ignored) || !canMoveTo(secondPerson, first, ignored)) continue;
       const firstSnapshot = { staffId: first.staffId, start: first.start, end: first.end, customTime: first.customTime };
       const secondSnapshot = { staffId: second.staffId, start: second.start, end: second.end, customTime: second.customTime };
       applyPerson(first, secondPerson); applyPerson(second, firstPerson);
+      if (!affectedGroupsValid([first, second])) { Object.assign(first, firstSnapshot); Object.assign(second, secondSnapshot); continue; }
       const next = optimizationVector();
       if (isBetter(next, baseline)) { optimized = true; rebuildStats(); break outer; }
       Object.assign(first, firstSnapshot); Object.assign(second, secondSnapshot);
+    }
+  }
+  rebuildStats();
+
+  // Some legal improvements need a three-person rotation. A common case is
+  // BB early + two SS late: move the BB late, keep the late-only SS late, and
+  // move the other SS early. Two-person swaps cannot reach that arrangement.
+  let rotationsOptimized = true; let rotationPasses = 0;
+  while (rotationsOptimized && rotationPasses < 50) {
+    rotationsOptimized = false; rotationPasses += 1;
+    const baseline = optimizationVector();
+    const rotatable = assignments.filter((slot) => !slot.locked && !slot.middleId && slot.staffId);
+    outerRotation: for (let firstIndex = 0; firstIndex < rotatable.length; firstIndex += 1) {
+      const first = rotatable[firstIndex];
+      for (let secondIndex = firstIndex + 1; secondIndex < rotatable.length; secondIndex += 1) {
+        const second = rotatable[secondIndex]; if (second.day !== first.day) continue;
+        for (let thirdIndex = secondIndex + 1; thirdIndex < rotatable.length; thirdIndex += 1) {
+          const third = rotatable[thirdIndex]; if (third.day !== first.day) continue;
+          const slots = [first, second, third];
+          const people = slots.map((slot) => staff.find((person) => person.id === slot.staffId));
+          if (people.some((person) => !person) || new Set(people.map((person) => person!.id)).size !== 3) continue;
+          const ignored = new Set(slots.map((slot) => slot.id));
+          const snapshots = slots.map((slot) => ({ staffId: slot.staffId, start: slot.start, end: slot.end, customTime: slot.customTime }));
+          for (const order of [[1, 2, 0], [2, 0, 1]]) {
+            if (!order.every((personIndex, slotIndex) => canMoveTo(people[personIndex]!, slots[slotIndex], ignored))) continue;
+            order.forEach((personIndex, slotIndex) => applyPerson(slots[slotIndex], people[personIndex]!));
+            const next = affectedGroupsValid(slots) ? optimizationVector() : baseline;
+            if (isBetter(next, baseline)) { rotationsOptimized = true; rebuildStats(); break outerRotation; }
+            slots.forEach((slot, index) => Object.assign(slot, snapshots[index]));
+          }
+          slots.forEach((slot, index) => Object.assign(slot, snapshots[index]));
+        }
+      }
     }
   }
   rebuildStats();
@@ -340,7 +422,12 @@ export function generateSchedule(staff: Staff[], period: PeriodState) {
     warnings.push(`【注意】${person?.name ?? "员工"} ${dateLabel(dates[slot.day])}可上${slot.start}–${slot.end}，已安排${slot.store.replace("店", "")}${shiftLabel(slot.shift)}；与标准时间不完全一致，${bridge ? `${bridge}，` : ""}请协商上下班时间。`);
   });
   assignments.filter((slot) => slot.staffId).forEach((slot) => { const person = staff.find((candidate) => candidate.id === slot.staffId); if (!person?.novice || person.mature) return; const leader = assignments.find((other) => slotGroup(other) === slotGroup(slot) && other.staffId && staff.find((candidate) => candidate.id === other.staffId)?.role === "SS"); const leaderPerson = staff.find((candidate) => candidate.id === leader?.staffId); if (leaderPerson && leaderPerson.employment !== "全职") warnings.push(`【注意】${dateLabel(dates[slot.day])}｜${slot.store}｜${shiftLabel(slot.shift)}：新员工${person.name}由兼职SS ${leaderPerson.name}带班。`); });
-  active.filter((person) => person.employment === "全职").forEach((person) => { const total = counts.get(person.id) ?? 0; if (total < fullTimeTarget) warnings.push(`${total <= Math.max(0, fullTimeTarget - 2) ? "【注意】" : "【提醒】"}${person.name} 本周期安排 ${total} 天，低于全职 ${fullTimeTarget} 天参考目标。`); if (total > fullTimeTarget) warnings.push(`【注意】${person.name} 本周期安排 ${total} 天，已超过全职 ${fullTimeTarget} 天参考目标；当前没有可直接替换的同角色兼职，请确认工作量和连续工作天数。`); });
+  active.filter((person) => person.employment === "全职").forEach((person) => {
+    const total = counts.get(person.id) ?? 0; const available = requestedDays(person);
+    if (total < fullTimeMinimum) warnings.push(`【硬】${person.name} 本周期仅安排 ${total} 天，低于全职最低 ${fullTimeMinimum} 天；${available < fullTimeMinimum ? `本人仅确认 ${available} 个可排日` : "现有合法班位不足"}，请补充可排时间或调整人员。`);
+    else if (total < fullTimeTarget) warnings.push(`【提醒】${person.name} 本周期安排 ${total} 天，达到最低要求，但低于全职 ${fullTimeTarget} 天参考目标。`);
+    if (total > fullTimeTarget) warnings.push(`【注意】${person.name} 本周期安排 ${total} 天，已超过全职 ${fullTimeTarget} 天参考目标；当前没有可直接替换的同角色兼职，请确认工作量和连续工作天数。`);
+  });
   active.forEach((person) => { const mix = shiftCounts.get(person.id) ?? { early: 0, late: 0 }; if (mix.early + mix.late >= 2 && Math.abs(mix.early - mix.late) >= 2) warnings.push(`【提醒】${person.name} 本周期白班${mix.early}次、晚班${mix.late}次，因覆盖或班次衔接未能完全均分。`); });
   assignments.filter((slot) => slot.staffId && slot.shift === "early").forEach((slot) => { if (assignments.some((other) => other.staffId === slot.staffId && other.day === slot.day - 1 && other.shift === "late")) warnings.push(`【注意】${staff.find((person) => person.id === slot.staffId)?.name}存在晚班接次日白班（${dateLabel(dates[slot.day])}）。`); });
   return { assignments, warnings };

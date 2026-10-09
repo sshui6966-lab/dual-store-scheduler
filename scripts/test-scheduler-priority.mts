@@ -12,9 +12,13 @@ function confirmEveryone(staff: Staff[], startDate: string, endDate: string) {
 }
 
 {
-  const staff = defaultStaff.map((person) => person.id === "shuanglin" ? { ...person, name: "Stefan" } : { ...person });
+  const staff = defaultStaff.map((person) => person.id === "shuanglin" ? { ...person, name: "Stefan" }
+    : person.id === "dandan" ? { ...person, store: "开元店" as const }
+      : person.id === "ivy" ? { ...person, store: "星光店" as const } : { ...person });
   const period = confirmEveryone(staff, "2026-10-12", "2026-10-18");
   period.availability.lisir[6] = "off";
+  period.availability.allen.fill("off");
+  period.availability.fox.fill("off");
   const result = generateSchedule(staff, period);
   const count = (staffId: string) => result.assignments.filter((slot) => slot.staffId === staffId).length;
   const lisirSlots = result.assignments.filter((slot) => slot.staffId === "lisir");
@@ -28,6 +32,7 @@ function confirmEveryone(staff: Staff[], startDate: string, endDate: string) {
   assert.ok(lisirLateToEarly <= 1, `lisir should avoid repeated late-to-early transitions, got ${lisirLateToEarly}`);
   assert.ok(result.assignments.filter((slot) => slot.staffId).every((slot) => { const person = staff.find((candidate) => candidate.id === slot.staffId); return person?.id === "jennifer" || person?.role !== "SS" || person?.store === slot.store; }), "the fully available SS roster should not create unnecessary cross-store assignments");
   for (const person of staff.filter((candidate) => candidate.employment === "全职")) {
+    assert.ok(count(person.id) >= 4, `${person.name} should receive the four-day full-time minimum when available`);
     assert.ok(count(person.id) <= 5, `${person.name} should not reach a sixth day while part-time demand can cover shifts`);
   }
 }
@@ -53,6 +58,40 @@ function confirmEveryone(staff: Staff[], startDate: string, endDate: string) {
   const result = generateSchedule(staff, period);
   const target = result.assignments.find((slot) => slot.id === "0-开元店-early-BB");
   assert.equal(target?.staffId, "alt-bb", "Stefan should not share nemo's shift when another BB is available");
+}
+
+{
+  const staff = defaultStaff.map((person) => person.id === "shuanglin" ? { ...person, name: "Stefan" }
+    : person.id === "dandan" ? { ...person, store: "开元店" as const }
+      : person.id === "ivy" ? { ...person, store: "星光店" as const } : { ...person });
+  const period = emptyPeriod(staff, "2026-10-12", "2026-10-18", "manager-example");
+  for (const person of staff) {
+    period.participation[person.id] = ["harper", "bobo"].includes(person.id) ? "excluded" : "confirmed";
+    period.availability[person.id] = Array(7).fill("off");
+  }
+  const set = (id: string, values: Array<"all" | "off" | "early" | "late">) => { period.availability[id] = values; };
+  set("jennifer", Array(7).fill("all"));
+  set("rachel", Array(7).fill("all"));
+  set("dandan", ["early", "early", "late", "off", "early", "early", "off"]);
+  set("lisir", ["all", "all", "all", "off", "all", "all", "all"]);
+  set("allen", ["early", "off", "off", "late", "off", "off", "off"]);
+  set("nemo", Array(7).fill("all"));
+  set("yaki", Array(7).fill("all"));
+  set("fox", ["off", "early", "early", "late", "off", "early", "off"]);
+  set("shuanglin", ["all", "all", "all", "off", "off", "all", "all"]);
+  set("mieleven", ["off", "all", "off", "off", "late", "late", "off"]);
+  set("sia", ["off", "off", "late", "late", "off", "early", "off"]);
+  set("demo", ["all", "all", "all", "all", "off", "off", "off"]);
+  set("ivy", ["late", "late", "off", "all", "late", "all", "all"]);
+  set("daz", ["late", "off", "off", "off", "off", "late", "early"]);
+
+  const result = generateSchedule(staff, period);
+  const slots = (id: string) => result.assignments.filter((slot) => slot.staffId === id);
+  const demoSlots = slots("demo");
+  assert.equal(demoSlots.length, 4, "demo should receive all four reported days");
+  assert.ok(Math.abs(demoSlots.filter((slot) => slot.shift === "early").length - demoSlots.filter((slot) => slot.shift === "late").length) <= 1, "demo's four flexible days should not all be early shifts");
+  assert.ok(slots("dandan").length >= 4, "dandan should reach the four-day full-time minimum without removing fox's requested shifts");
+  assert.equal(slots("fox").length, 4, "fox's four specific part-time shifts should remain filled");
 }
 
 console.log("scheduler priority checks passed");
